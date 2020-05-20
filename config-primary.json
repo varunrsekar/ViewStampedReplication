@@ -1,0 +1,31 @@
+{
+  "id": 0,
+  "quorum_size": 3,
+  "replicas": [
+    {
+      "id": 0,
+      "primary": true,
+      "port": 1234
+    },
+    {
+      "id": 1,
+      "primary": false,
+      "port": 1235
+    },
+    {
+      "id": 2,
+      "primary": false,
+      "port": 1236
+    },
+    {
+      "id": 3,
+      "primary": false,
+      "port": 1237
+    },
+    {
+      "id": 4,
+      "primary": false,
+      "port": 1238
+    }
+  ]
+}
