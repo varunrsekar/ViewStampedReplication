@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/http"
 	"net/rpc"
+	"sync"
 	"viewStampedReplication/server/clientrpc"
 	log2 "viewStampedReplication/server/log"
 	"viewStampedReplication/server/viewmanager"
@@ -20,28 +21,21 @@ type Service interface {
 
 type Impl struct {
 	*viewmanager.Impl
-	WorkQueue chan *ClientRequest
+	WorkQueue chan *clientrpc.WorkRequest
 }
 
 func GetImpl() *Impl {
 	return appImpl
 }
 
-func (impl *Impl) Request(req *ClientRequest, res *clientrpc.EmptyResponse) error {
+func (impl *Impl) Request(req *ClientRequest, res *ClientReply) error {
 	req.LogRequest()
-	reply := &ClientReply{
-		Res: nil,
-		Err: nil,
-	}
-	c := impl.Config.GetClient(req.ClientId)
 	if !impl.IsClusterStatusNormal() {
-		reply.Err = fmt.Errorf("invalid operation status of cluster: %s", impl.GetClusterStatus())
-		c.Do("Client.Reply", reply, &clientrpc.EmptyResponse{}, true)
+		res.Err = fmt.Errorf("invalid operation status of cluster: %s", impl.GetClusterStatus())
 		return nil
 	}
 	if !impl.IsPrimary() {
-		reply.Err = fmt.Errorf("invalid operation status of host: %s", viewreplication.RoleBackup)
-		c.Do("Client.Reply", reply, &clientrpc.EmptyResponse{}, true)
+		res.Err = fmt.Errorf("invalid operation status of host: %s", viewreplication.RoleBackup)
 		return nil
 	}
 
@@ -52,37 +46,51 @@ func (impl *Impl) Request(req *ClientRequest, res *clientrpc.EmptyResponse) erro
 	lastResponse := clientState.LastResponse
 	if lastResponse != nil {
 		if req.RequestId < lastResponse.RequestId {
-			reply.Err = fmt.Errorf("stale request id detected")
-			c.Do("Client.Reply", reply, &clientrpc.EmptyResponse{}, true)
+			res.Res = nil
+			res.Err = fmt.Errorf("stale request id detected")
 			return nil
 		} else if req.RequestId == lastResponse.RequestId {
-			reply.Res = clientState.LastResponse
+			res.Res = clientState.LastResponse
 			log.Printf("Request already executed; req: %v, res: %v", req, res)
-			c.Do("Client.Reply", reply, &clientrpc.EmptyResponse{}, true)
 			return nil
 		}
 	}
 	// Add request to queue to be processed in viewreplication package
-	impl.BufferRequest(req)
+	workReq := impl.BufferRequest(req)
+	workReq.GetWG().Wait()
+	*res = *(workReq.GetResult().(*ClientReply))
 	return nil
 }
 
-func (impl *Impl) BufferRequest(req *ClientRequest) {
-	impl.WorkQueue <- req
+func (impl *Impl) BufferRequest(req *ClientRequest) *clientrpc.WorkRequest {
+	var wg sync.WaitGroup
+	workReq := clientrpc.NewWorkRequest(req, &wg)
+	impl.WorkQueue <- workReq
+	wg.Add(1)
+	return workReq
 }
 
 func (impl *Impl) ProcessClientRequests() {
 	for {
-		req := <-(impl.WorkQueue)
+		workReq := <-(impl.WorkQueue)
+		req := workReq.GetRequest().(*ClientRequest)
 		log.Printf("Received work request; req: %v", req)
 		opId := impl.AdvanceOpId()
 		op := impl.AppendOp(req, opId)
-		impl.UpdateClientState(req)
-		impl.SendPrepareMessages(req.ClientId, req.RequestId, op)
+
+		impl.UpdateClientState(workReq)
+		done := impl.SendPrepareMessages(req.ClientId, req.RequestId, op)
+		impl.WaitForQuorum(done)
+		result := op.Commit()
+		impl.AdvanceCommitId()
+		workRes := workReq.GetResult()
+		// This should update the last client response in the client table as well (since we're dealing in pointers).
+		workRes.(*viewreplication.OpResponse).Result = result
+		workReq.GetWG().Done()
 	}
 }
 
-func (impl *Impl) PrepareOk(req *viewreplication.PrepareOkRequest, res *clientrpc.EmptyResponse) error {
+func (impl *Impl) PrepareOk(req *PrepareOkRequest, res *clientrpc.EmptyResponse) error {
 	if !impl.IsPrimary() {
 		log.Printf("Not primary. Ignoring request; req: %v", req)
 		return nil
@@ -115,11 +123,16 @@ func (impl *Impl) AppendOp(req *ClientRequest, opId int) log2.Operation {
 	return impl.Impl.AppendOp(opId, logMsg)
 }
 
-func (impl *Impl) UpdateClientState(req *ClientRequest) *viewreplication.OpResponse {
-	return impl.Impl.UpdateClientState(req.ClientId, req.RequestId, nil)
+func (impl *Impl) UpdateClientState(workReq *clientrpc.WorkRequest) {
+	cr, ok := workReq.GetRequest().(*ClientRequest)
+	if !ok {
+		log.Fatalf("WorkRequest is not of type ClientRequest; req: %v", workReq)
+	}
+	lastResponse := impl.Impl.UpdateClientState(cr.ClientId, cr.RequestId, nil)
+	workReq.SetResult(lastResponse)
 }
 
-/*func (impl *Impl) WaitForQuorum(done chan *viewreplication.PrepareOkResponse) {
+func (impl *Impl) WaitForQuorum(done chan *viewreplication.PrepareOkResponse) {
 	var quorum int
 	var res *viewreplication.PrepareOkResponse
 	for quorum < impl.GetQuorumSize() {
@@ -129,7 +142,7 @@ func (impl *Impl) UpdateClientState(req *ClientRequest) *viewreplication.OpRespo
 			quorum += 1
 		}
 	}
-}*/
+}
 
 func GetApp() *Impl {
 	return appImpl
@@ -139,7 +152,7 @@ func Init() {
 	viewmanager.Init()
 	appImpl = &Impl{
 		Impl: viewmanager.GetImpl(),
-		WorkQueue:       make(chan *ClientRequest, clientrpc.MaxRequests),
+		WorkQueue:       make(chan *clientrpc.WorkRequest, clientrpc.MaxRequests),
 	}
 	rpc.RegisterName("ViewStampedReplication", appImpl)
 	log.Print("App initialization successful")

@@ -6,6 +6,8 @@ import (
 	"sync"
 )
 
+const MaxRequests = 100
+
 type Client struct {
 	sync.Mutex
 	c *rpc.Client
@@ -18,6 +20,12 @@ type Request interface {
 
 type Response interface {
 	LogResponse()
+}
+
+type EmptyResponse struct {}
+
+func (res *EmptyResponse) LogResponse() {
+	log.Print("[EmptyResponse] Empty response")
 }
 
 type WorkRequest struct {
@@ -49,21 +57,26 @@ func NewWorkRequest(req Request, wg *sync.WaitGroup) *WorkRequest {
 		result: nil,
 	}
 }
-func (client *Client) prepare() {
+func (client *Client) prepare() error {
 	if client.c != nil {
-		return
+		return nil
 	}
+	log.Printf("Preparing rpc client; client: %v", client)
 	client.Lock()
 	defer client.Unlock()
 	var err error
 	client.c, err = rpc.DialHTTP("tcp", client.Hostname)
 	if err != nil {
-		log.Fatalf("Failed to create RPC client to host %s due to error '%v'", client.Hostname, err)
+		log.Printf("[error] Failed to create RPC client to host %s due to error '%v'. Skipping request", client.Hostname, err)
+		return err
 	}
+	return nil
 }
 
 func (client *Client) Do(api string, req Request, res Response) {
-	client.prepare()
+	if client.prepare() != nil {
+		return
+	}
 	err := client.c.Call(api, req, res)
 	if err != nil {
 		log.Printf("Received error from RPC request; api: %s, req: %s, err: %v", api, req, err)
@@ -71,9 +84,11 @@ func (client *Client) Do(api string, req Request, res Response) {
 }
 
 func (client *Client) AsyncDo(api string, req Request, res Response) {
-	client.prepare()
-	err := client.c.Go(api, req, res, nil)
-	if err != nil {
-		log.Printf("Received error from async RPC request; api: %s, req: %s, err: %v", api, req, err)
+	if client.prepare() != nil {
+		return
+	}
+	call := client.c.Go(api, req, res, nil)
+	if call.Error != nil {
+		log.Printf("Received error from async RPC request; api: %s, req: %v, err: %v", api, req, call.Error)
 	}
 }

@@ -1,5 +1,4 @@
 {
-  "id": 0,
   "quorum_size": 3,
   "replicas": [
     {
@@ -26,6 +25,20 @@
       "id": 4,
       "primary": false,
       "port": 1238
+    }
+  ],
+  "clients": [
+    {
+      "id": "c0",
+      "port": 2345
+    },
+    {
+      "id": "c1",
+      "port": 2346
+    },
+    {
+      "id": "c2",
+      "port": 2347
     }
   ]
 }
