@@ -119,18 +119,6 @@ func (impl *Impl) UpdateClientState(req *ClientRequest) *viewreplication.OpRespo
 	return impl.Impl.UpdateClientState(req.ClientId, req.RequestId, nil)
 }
 
-/*func (impl *Impl) WaitForQuorum(done chan *viewreplication.PrepareOkResponse) {
-	var quorum int
-	var res *viewreplication.PrepareOkResponse
-	for quorum < impl.GetQuorumSize() {
-		res = <-done
-		if res != nil {
-			res.LogResponse()
-			quorum += 1
-		}
-	}
-}*/
-
 func GetApp() *Impl {
 	return appImpl
 }
@@ -141,7 +129,7 @@ func Init() {
 		Impl: viewmanager.GetImpl(),
 		WorkQueue:       make(chan *ClientRequest, clientrpc.MaxRequests),
 	}
-	rpc.RegisterName("ViewStampedReplication", appImpl)
+	rpc.RegisterName("Application", appImpl)
 	log.Print("App initialization successful")
 	go appImpl.ProcessClientRequests()
 	rpc.HandleHTTP()

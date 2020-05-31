@@ -159,7 +159,7 @@ func (impl *Impl) StartView(req *StartViewRequest, res *clientrpc.EmptyResponse)
 				OpId:      op.OpId,
 				ReplicaId: impl.Config.Id,
 			}
-			impl.GetPrimary().Do("ViewStampedReplication.PrepareOk", req, &clientrpc.EmptyResponse{}, true)
+			impl.GetPrimary().Do("Application.PrepareOk", req, &clientrpc.EmptyResponse{}, true)
 		}
 	}
 	return nil

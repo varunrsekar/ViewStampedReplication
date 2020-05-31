@@ -15,8 +15,11 @@ type LogMessage struct {
 
 type Message struct {
 	Action string
+	Key string
+	Val *string
 }
 
 type OpResult struct {
 	Val *string
+	Err error
 }
