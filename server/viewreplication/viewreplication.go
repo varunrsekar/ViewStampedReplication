@@ -2,27 +2,33 @@ package viewreplication
 
 import (
 	"bytes"
-	"fmt"
+	"github.com/davecgh/go-spew/spew"
 	"log"
 	"math/rand"
 	"net/rpc"
+	"strconv"
 	"sync"
 	"time"
-	"viewStampedReplication/server/clientrpc"
-	log2 "viewStampedReplication/server/log"
+	"viewStampedReplication/clientrpc"
+	log2 "viewStampedReplication/log"
 	"viewStampedReplication/server/serviceconfig"
 )
 
 const (
 	primaryTimeout = 4800 // Timeout for primary node in milliseconds.
-	backupTimeout = 5000 // Timeout for backup node in milliseconds.
+	backupTimeout = 5800 // Timeout for backup node in milliseconds.
 )
 
 var vrImpl *Impl
 
+// Protocol starts only after receiving commit from primary.
+var isPrimaryReqRecvd bool
+
 type ViewReplication interface {
-	Prepare(req *PrepareRequest, res *PrepareOkResponse) error
+	Prepare(req *PrepareRequest, res *clientrpc.EmptyResponse) error
 	Commit(req *CommitRequest, res *clientrpc.EmptyResponse) error
+	GetState(req *GetStateRequest, res *NewStateResponse) error
+	Recovery(req *RecoveryRequest, res *RecoveryResponse) error
 }
 
 type ClientState struct {
@@ -36,7 +42,7 @@ type Impl struct {
 	OpId            int
 	Ops             []log2.Operation
 	CommitId        int
-	ClusterStatus            Status
+	ClusterStatus   Status
 	ClientStates    map[string]*ClientState
 	PrepareQueue    chan *clientrpc.WorkRequest
 	CommitQueue     chan *clientrpc.WorkRequest
@@ -44,11 +50,11 @@ type Impl struct {
 	ActivityTimeout time.Duration
 }
 
-func (impl *Impl) Prepare(req *PrepareRequest, res *PrepareOkResponse) error {
-	req.LogRequest()
+func (impl *Impl) Prepare(req *PrepareRequest, res *clientrpc.EmptyResponse) error {
+	req.LogRequest(true)
+	impl.SetPrimaryReqRecvd(true)
 	workReq := impl.BufferPrepareRequest(req)
 	workReq.GetWG().Wait()
-	*res = *(workReq.GetResult().(*PrepareOkResponse))
 	return nil
 }
 
@@ -75,22 +81,31 @@ func (impl *Impl) ProcessPrepareRequests() {
 		} else if req.OpId > currOpId+1 {
 			impl.WaitForStateTransfer(req.View)
 		}
+		if req.CommitId > impl.CommitId {
+			impl.DoPendingCommits(req.CommitId)
+		}
 		impl.AdvanceOpId()
 		impl.AppendOp(req.OpId, req.Log)
 		impl.UpdateClientState(req.ClientId, req.RequestId, nil)
-		workReq.SetResult(&PrepareOkResponse{
+		okReq := &PrepareOkRequest{
 			View:      impl.View,
-			OpId:      impl.OpId,
+			OpId:      req.OpId,
 			ReplicaId: impl.Config.Id,
-		})
+		}
+		okReq.LogRequest(false)
+		replica := impl.GetPrimary()
+		(&replica).Do("Application.PrepareOk", okReq, &clientrpc.EmptyResponse{}, true)
 		workReq.GetWG().Done()
 	}
 }
 
 func (impl *Impl) Commit(req *CommitRequest, res *clientrpc.EmptyResponse) error {
-	req.LogRequest()
+	req.LogRequest(true)
+	impl.ActivityTimer.Reset(impl.ActivityTimeout)
+	isPrimaryReqRecvd = true
 	if req.CommitId == -1 {
 		// When running for the first time without any client requests, do nothing.
+
 		return nil
 	}
 	workReq := impl.BufferCommitRequest(req)
@@ -99,8 +114,6 @@ func (impl *Impl) Commit(req *CommitRequest, res *clientrpc.EmptyResponse) error
 }
 
 func (impl *Impl) BufferCommitRequest(req *CommitRequest) *clientrpc.WorkRequest {
-	impl.ActivityTimer.Reset(impl.ActivityTimeout)
-
 	var wg sync.WaitGroup
 	workReq := clientrpc.NewWorkRequest(req, &wg)
 	impl.CommitQueue <- workReq
@@ -119,40 +132,43 @@ func (impl *Impl) ProcessCommitRequests() {
 		if req.CommitId > currOpId {
 			impl.WaitForStateTransfer(req.View)
 		}
-		for _, op := range impl.Ops {
-			if req.CommitId == op.OpId {
-				result := op.Commit()
+		for i, _ := range impl.Ops {
+			if req.CommitId == impl.Ops[i].OpId {
+				if impl.Ops[i].Committed {
+					log.Printf("Operation already committed: %+v", spew.NewFormatter(impl.Ops[i]))
+					break
+				}
+				result := impl.Ops[i].Commit()
 				impl.AdvanceCommitId()
-				impl.UpdateClientState(op.Log.ClientId, op.Log.RequestId, result)
+				impl.UpdateClientState(impl.Ops[i].Log.ClientId, impl.Ops[i].Log.RequestId, result)
 			}
 		}
 		workReq.GetWG().Done()
 	}
 }
 
-func (impl *Impl) GetState(req *GetStateRequest, res *NewStateResponse) {
-	req.LogRequest()
-	if req.View != impl.View {
-		log.Printf("Ignoring GetStateRequest due to view mismatch; reqView: %d, currView: %d", req.View, impl.View)
-		return
-	}
-	*res = NewStateResponse{
-		View:     impl.View,
-		OpId:     impl.OpId,
-		CommitId: impl.CommitId,
-		Ops:      make([]log2.Operation, 0),
-	}
+func (impl *Impl) GetState(req *GetStateRequest) *NewStateResponse {
+	req.LogRequest(true)
+
+	ops := make([]log2.Operation, 0)
 	for _, op := range impl.Ops {
 		if op.OpId <= req.OpId {
 			continue
 		}
-		res.Ops = append(res.Ops, op)
+		ops = append(ops, op)
 	}
-	return
+	res := &NewStateResponse{
+		View:     impl.View,
+		OpId:     impl.OpId,
+		CommitId: impl.CommitId,
+		Ops:      ops,
+		ReplicaId: impl.Config.Id,
+	}
+	return res
 }
 
 func (impl *Impl) WaitForStateTransfer(view int) {
-	if view > impl.View {
+	if view >= impl.View {
 		impl.OpId = impl.CommitId
 		impl.ClearOpsAfterOpId()
 		getStateReq := &GetStateRequest{
@@ -160,36 +176,49 @@ func (impl *Impl) WaitForStateTransfer(view int) {
 			OpId:      impl.OpId,
 			ReplicaId: impl.Config.Id,
 		}
-		for _, replica := range impl.GetOtherReplicas() {
-			res := &NewStateResponse{
-				View:     -1,
-				OpId:     -1,
-				CommitId: -1,
-				Ops:      nil,
+		getStateReq.LogRequest(false)
+		replicas := impl.GetOtherReplicas()
+		for i, _ := range replicas {
+			var done chan bool
+			var res = &NewStateResponse{
+				View:      impl.View,
+				OpId:      -1,
+				CommitId:  -1,
+				Ops:       nil,
+				ReplicaId: replicas[i].Id,
 			}
-			replica.Do("ViewManager.GetState", getStateReq, res, false)
-			if res.View != view {
-				// This means the replica hasn't processed the state transfer request and is ignoring it.
-				continue
+			go func() {
+				replicas[i].Do("ViewManager.GetState", getStateReq, res, false)
+				res.LogResponse(true)
+				if res.View == -1 {
+					// This means the replica hasn't processed the state transfer request and is ignoring it.
+					done <- false
+				}
+				for _, op := range res.Ops {
+					impl.Ops = append(impl.Ops, op)
+				}
+				impl.View = res.View
+				impl.OpId = res.OpId
+				impl.DoPendingCommits(res.CommitId)
+				done <- true
+			}()
+			fin := <- done
+			if fin {
+				break
 			}
-			for _, op := range res.Ops {
-				impl.Ops = append(impl.Ops, op)
-			}
-			impl.View = res.View
-			impl.OpId = res.OpId
-			impl.WaitForCommits(res.CommitId)
 		}
 	}
 }
 
-func (impl *Impl) WaitForCommits(commitId int) {
-	for _, op := range impl.Ops {
-		if op.OpId < impl.CommitId || op.OpId > commitId {
+func (impl *Impl) DoPendingCommits(commitId int) {
+	for i, _  := range impl.Ops {
+		if impl.Ops[i].OpId < impl.CommitId || impl.Ops[i].OpId > commitId {
 			continue
 		}
-		result := op.Commit()
+		impl.Ops[i].Committed = false
+		result := impl.Ops[i].Commit()
 		impl.AdvanceCommitId()
-		impl.UpdateClientState(op.Log.ClientId, op.Log.RequestId, result)
+		impl.UpdateClientState(impl.Ops[i].Log.ClientId, impl.Ops[i].Log.RequestId, result)
 	}
 }
 
@@ -197,11 +226,13 @@ func (impl *Impl) ClearOpsAfterOpId() {
 	var idx = 0
 	for _, op := range impl.Ops {
 		if op.OpId <= impl.OpId {
-			impl.Ops[idx] = op
-			idx += 1
+			idx++
 		}
 	}
-	impl.Ops = impl.Ops[:idx]
+	if idx == 0 {
+		return
+	}
+	impl.Ops = impl.Ops[:idx-1]
 }
 
 func (impl *Impl) AdvanceOpId() int {
@@ -218,37 +249,49 @@ func (impl *Impl) AppendOp(opId int, logMsg log2.LogMessage) log2.Operation {
 	op := log2.Operation{
 		OpId: opId,
 		Log: logMsg,
-		Quorum: make([]bool, len(impl.Config.replicas)),
+		Quorum: make(map[int]bool),
+		Committed: false,
 	}
 	impl.Ops = append(impl.Ops, op)
 	return op
 }
 
-func (impl *Impl) GetBackups() []*Replica {
-	backups := make([]*Replica, 0)
-	for _, replica := range impl.Config.replicas {
+func (impl *Impl) GetBackups() []Replica {
+	backups := make([]Replica, 0)
+	for i, replica := range impl.Config.replicas {
 		if !replica.IsPrimary() {
-			backups = append(backups, replica)
+			backups = append(backups, impl.Config.replicas[i])
 		}
 	}
 	return backups
 }
 
-func (impl *Impl) GetPrimary() *Replica {
-	for _, replica := range impl.Config.replicas {
+func (impl *Impl) GetPrimary() Replica {
+	for i, replica := range impl.Config.replicas {
 		if replica.IsPrimary() {
-			return replica
+			return impl.Config.replicas[i]
 		}
 	}
-	return nil
+	return Replica{}
 }
 
-func (impl *Impl) GetOtherReplicas() []*Replica {
-	replicas := make([]*Replica, 0)
-	for _, replica := range impl.Config.replicas {
-		if impl.Config.Id != replica.Id {
-			replicas = append(replicas, replica)
+func (impl *Impl) GetOtherReplicas() []Replica {
+	replicas := make([]Replica, 0)
+	for i, _ := range impl.Config.replicas {
+		if impl.Config.Id != impl.Config.replicas[i].Id {
+			replicas = append(replicas, impl.Config.replicas[i])
 		}
+	}
+	var selfIdx = -1
+	for i, replica := range replicas {
+		if replica.Id == impl.Config.Id {
+			selfIdx = i
+			break
+		}
+	}
+	if selfIdx != -1 {
+		replicas[selfIdx] = replicas[len(replicas)-1]
+		replicas = replicas[:len(replicas)-1]
 	}
 	return replicas
 }
@@ -292,6 +335,7 @@ func (impl *Impl) UpdateClientState(clientId string, requestId int, res *log2.Op
 }
 
 func (impl *Impl) Recovery(req *RecoveryRequest, res *RecoveryResponse) error {
+	req.LogRequest(true)
 	if !impl.IsClusterStatusNormal() {
 		log.Printf("Cluster status is not normal. Ignoring request; status: %s, req: %+v", impl.ClusterStatus, req)
 		return nil
@@ -300,12 +344,13 @@ func (impl *Impl) Recovery(req *RecoveryRequest, res *RecoveryResponse) error {
 		log.Printf("Returning RecoveryResponse as backup; replica: %d, reqNonce: %v", impl.Config.Id, req.Nonce)
 		*res = RecoveryResponse{
 			View:      impl.View,
-			Ops:       nil,
+			Ops:       make([]log2.Operation, 0),
 			Nonce:     req.Nonce,
 			OpId:      -1,
-			CommitId:  -1,
+			CommitId:  -2,
 			ReplicaId: impl.Config.Id,
 		}
+		res.LogResponse(false)
 		return nil
 	}
 	log.Printf("Returning RecoveryResponse as primary; replica: %d, reqNonce: %v", impl.Config.Id, req.Nonce)
@@ -317,25 +362,30 @@ func (impl *Impl) Recovery(req *RecoveryRequest, res *RecoveryResponse) error {
 		CommitId:  impl.CommitId,
 		ReplicaId: impl.Config.Id,
 	}
+	res.LogResponse(false)
 	return nil
 }
 
 func (impl *Impl) SendRecoveryRequests(req *RecoveryRequest) chan *RecoveryResponse {
 	done := make(chan *RecoveryResponse)
-	for _, replica := range impl.GetOtherReplicas() {
-		go func(replica *Replica) {
+	replicas := impl.GetOtherReplicas()
+	var idx int
+	for i, _ := range replicas {
+		idx = i
+		go func(idx int) {
+			log.Printf("Sending recovery request to replica %d; req: %+v", replicas[idx].Id, req)
+			req.LogRequest(false)
 			res := &RecoveryResponse{
 				View:      -1,
 				Ops:       nil,
 				Nonce:     nil,
 				OpId:      -1,
 				CommitId:  -1,
-				ReplicaId: replica.Id,
+				ReplicaId: replicas[idx].Id,
 			}
-			log.Printf("[INFO] Sending Recovery request; replica: %d, req: %+v", replica.Id, req)
-			replica.Do("ViewManager.Recovery", req, res, false)
+			replicas[idx].Do("ViewManager.Recovery", req, res, false)
 			done <- res
-		}(replica)
+		}(idx)
 	}
 	return done
 }
@@ -347,9 +397,9 @@ func (impl *Impl) WaitForRecoveryQuorum(req *RecoveryRequest, done chan *Recover
 		res := <- done
 		if res != nil {
 			if bytes.Equal(req.Nonce, res.Nonce) {
-				res.LogResponse()
-				// CommitId is -1 for backups and set for primary.
-				if res.CommitId != -1 {
+				res.LogResponse(true)
+				// CommitId is -2 for backups and set for primary.
+				if res.CommitId != -2 {
 					primaryResponse = res
 				}
 				quorum += 1
@@ -362,6 +412,7 @@ func (impl *Impl) WaitForRecoveryQuorum(req *RecoveryRequest, done chan *Recover
 			}
 		}
 	}
+	log.Printf("Recovery response from primary: %+v", primaryResponse)
 	return primaryResponse
 }
 
@@ -371,10 +422,12 @@ func (impl *Impl) IsClusterStatusNormal() bool {
 
 func (impl *Impl) SetClusterStatusNormal() {
 	impl.ClusterStatus = StatusNormal
+	log.Printf("Cluster status changed to %s", StatusNormal)
 }
 
 func (impl *Impl) SetClusterStatusViewChange() {
 	impl.ClusterStatus = StatusViewChange
+	log.Printf("Cluster status changed to %s", StatusViewChange)
 }
 
 func (impl *Impl) GetClusterStatus() Status {
@@ -382,21 +435,25 @@ func (impl *Impl) GetClusterStatus() Status {
 }
 
 func (impl *Impl) UpdatePrimaryNode(id int) {
+
 	if id == impl.Config.Id {
-		impl.Config.SetPrimary()
+		impl.ActivityTimeout = primaryTimeout * time.Millisecond
+		impl.Config.SetPrimary(id, true)
 	} else {
-		impl.Config.SetBackup()
+		impl.ActivityTimeout = backupTimeout * time.Millisecond
+		impl.Config.SetPrimary(id, false)
 	}
 
-	for _, replica := range impl.GetOtherReplicas() {
-		if id == replica.Id {
-			replica.SetPrimary()
-		} else {
-			replica.SetBackup()
-		}
-	}
+	log.Printf("Dumping configuration state; config: %+v", spew.NewFormatter(impl.Config))
 }
 
+func (impl *Impl) IsPrimaryReqRecvd() bool {
+	return isPrimaryReqRecvd
+}
+
+func (impl *Impl) SetPrimaryReqRecvd(status bool) {
+	isPrimaryReqRecvd = status
+}
 func GetImpl() *Impl {
 	return vrImpl
 }
@@ -405,7 +462,7 @@ func prepareConfig() Configuration {
 	sConfig := serviceconfig.GetConfig()
 	var role Role
 	var isPrimary bool
-	replicas := make(map[int]*Replica)
+	replicas := make(map[int]Replica)
 	for _, replica := range sConfig.Replicas {
 		if replica.Primary {
 			role = RolePrimary
@@ -415,30 +472,28 @@ func prepareConfig() Configuration {
 		} else {
 			role = RoleBackup
 		}
-		c := clientrpc.Client{
-			Hostname: fmt.Sprintf("localhost:%d", replica.Port),
-		}
-		replicas[replica.Id] = NewReplica(replica.Id, c, replica.Port, role)
+		replicas[replica.Id] = NewReplica(replica.Id, replica.Port, role)
 	}
-	clients := make(map[string]*Client)
+	clients := make(map[string]Client)
 	for _, client := range sConfig.Clients {
-		c := clientrpc.Client{
-			Hostname: fmt.Sprintf("localhost:%d", client.Port),
-		}
-		clients[client.Id] = NewClient(client.Id, c, client.Port)
+		clients[client.Id] = NewClient(client.Id, client.Port)
 	}
 
-	return Configuration{
+	var r = replicas[sConfig.Id]
+	c := Configuration{
 		Id:       sConfig.Id,
-		Self: replicas[sConfig.Id],
+		Self: &r,
 		QuorumSize: sConfig.QuorumSize,
 		replicas: replicas,
 		clients: clients,
 		primary:  isPrimary,
 	}
+	log.Printf("Configuration: %+v", spew.NewFormatter(c))
+	return c
 }
 func Init() {
 	config := prepareConfig()
+	log2.Init(strconv.Itoa(config.Id))
 	var timeout time.Duration
 	if config.IsPrimary() {
 		timeout = primaryTimeout * time.Millisecond
@@ -458,6 +513,7 @@ func Init() {
 		CommitId: -1,
 		PrepareQueue:    make(chan *clientrpc.WorkRequest, clientrpc.MaxRequests),
 		CommitQueue:     make(chan *clientrpc.WorkRequest, clientrpc.MaxRequests),
+		ClientStates: make(map[string]*ClientState),
 		ActivityTimer:   time.NewTimer(timeout),
 		ActivityTimeout: timeout,
 	}
@@ -480,6 +536,10 @@ func Init() {
 		vrImpl.UpdatePrimaryNode(res.ReplicaId)
 		vrImpl.View = res.View
 		vrImpl.Ops = res.Ops
+		for i, _ := range vrImpl.Ops {
+			vrImpl.Ops[i].Committed = false
+			vrImpl.Ops[i].Commit()
+		}
 		vrImpl.OpId = res.OpId
 		vrImpl.CommitId = res.CommitId
 		// Resume Normal operation of cluster.
@@ -488,7 +548,7 @@ func Init() {
 
 	// Only after recovery is done, will this node be available to receive requests.
 	rpc.RegisterName("ViewReplication", vrImpl)
-	log.Print("ViewReplication initialization successful")
 	go vrImpl.ProcessPrepareRequests()
 	go vrImpl.ProcessCommitRequests()
+	log.Print("ViewReplication initialization successful")
 }

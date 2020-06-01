@@ -1,42 +1,35 @@
 package viewreplication
 
 import (
-	"log"
-	"sync"
-	log2 "viewStampedReplication/server/log"
+	"fmt"
+	"github.com/davecgh/go-spew/spew"
+	"viewStampedReplication/clientrpc"
+	log2 "viewStampedReplication/log"
 )
 
 
 type PrepareRequest struct {
-	ClientId string
+	ClientId  string
 	RequestId int
-	View     int
-	Log      log2.LogMessage
-	OpId     int
-	CommitId int
-}
-
-func (req *PrepareRequest) LogRequest() {
-	log.Printf("[PrepareRequest] prepare request: %v", req)
-}
-
-type PrepareOkResponse struct {
-	View int
-	OpId int
+	View      int
+	Log       log2.LogMessage
+	OpId      int
+	CommitId  int
 	ReplicaId int
 }
 
-func (res *PrepareOkResponse) LogResponse() {
-	log.Printf("[PrepareOkResponse] prepare ok response: %v", res)
+func (req *PrepareRequest) LogRequest(recv bool) {
+	clientrpc.Log(fmt.Sprintf("[PrepareRequest] %s prepare request: %v", "%s", spew.NewFormatter(req)), recv)
 }
 
 type CommitRequest struct {
 	View int
 	CommitId int
+	ReplicaId int
 }
 
-func (req *CommitRequest) LogRequest() {
-	log.Printf("[CommitRequest] commit request: %v", req)
+func (req *CommitRequest) LogRequest(recv bool) {
+	clientrpc.Log(fmt.Sprintf("[CommitRequest] %s commit request: %+v", "%s", spew.NewFormatter(req)), recv)
 }
 
 type GetStateRequest struct {
@@ -45,8 +38,8 @@ type GetStateRequest struct {
 	ReplicaId int
 }
 
-func (req *GetStateRequest) LogRequest() {
-	log.Printf("[GetStateRequest] get state request: %+v", req)
+func (req *GetStateRequest) LogRequest(recv bool) {
+	clientrpc.Log(fmt.Sprintf("[GetStateRequest] %s get state request: %+v", "%s", spew.NewFormatter(req)), recv)
 }
 
 type NewStateResponse struct {
@@ -54,24 +47,11 @@ type NewStateResponse struct {
 	OpId int
 	CommitId int
 	Ops []log2.Operation
+	ReplicaId int
 }
 
-func (res *NewStateResponse) LogResponse() {
-	log.Printf("[NewStateResponse] new state response: %+v", res)
-}
-
-type PrepareWorkRequest struct {
-	req *PrepareRequest
-	wg *sync.WaitGroup
-	result *PrepareOkResponse
-}
-
-func (pwr *PrepareWorkRequest) GetWG() *sync.WaitGroup {
-	return pwr.wg
-}
-
-func (pwr *PrepareWorkRequest) GetRequest() *PrepareRequest {
-	return pwr.req
+func (res *NewStateResponse) LogResponse(recv bool) {
+	clientrpc.Log(fmt.Sprintf("[NewStateResponse] %s new state response: %+v", "%s", spew.NewFormatter(res)), recv)
 }
 
 type OpResponse struct {
@@ -80,8 +60,8 @@ type OpResponse struct {
 	Result    *log2.OpResult
 }
 
-func (or *OpResponse) LogResponse() {
-	log.Printf("[OpResponse] operation response: %+v", or)
+func (or *OpResponse) LogResponse(recv bool) {
+	clientrpc.Log(fmt.Sprintf("[OpResponse] %s operation response: %+v", "%s", spew.NewFormatter(or)), recv)
 }
 
 type RecoveryRequest struct {
@@ -89,8 +69,8 @@ type RecoveryRequest struct {
 	ReplicaId int
 }
 
-func (req *RecoveryRequest) LogRequest() {
-	log.Printf("[RecoveryRequest] Recovery request; req: %+v", req)
+func (req *RecoveryRequest) LogRequest(recv bool) {
+	clientrpc.Log(fmt.Sprintf("[RecoveryRequest] %s recovery request; req: %+v", "%s", spew.NewFormatter(req)), recv)
 }
 
 type RecoveryResponse struct {
@@ -102,8 +82,8 @@ type RecoveryResponse struct {
 	ReplicaId int
 }
 
-func (res *RecoveryResponse) LogResponse() {
-	log.Printf("[RecoveryResponse] Recovery response; res: %+v", res)
+func (res *RecoveryResponse) LogResponse(recv bool) {
+	clientrpc.Log(fmt.Sprintf("[RecoveryResponse] %s recovery response; res: %+v", "%s", spew.NewFormatter(res)), recv)
 }
 
 type PrepareOkRequest struct {
@@ -112,6 +92,6 @@ type PrepareOkRequest struct {
 	ReplicaId int
 }
 
-func (req *PrepareOkRequest) LogRequest() {
-	log.Printf("[PrepareOkResponst] prepare ok request: %v", req)
+func (req *PrepareOkRequest) LogRequest(recv bool) {
+	clientrpc.Log(fmt.Sprintf("[PrepareOkRequest] %s prepare ok request: %+v", "%s", spew.NewFormatter(req)), recv)
 }

@@ -1,12 +1,13 @@
 package logger
 
 import (
-	logrus "github.com/sirupsen/logrus"
+	"github.com/sirupsen/logrus"
 	lumberjack "gopkg.in/natefinch/lumberjack.v2"
+	"log"
 	"time"
 )
 
-var logger *logrus.Logger
+var reqLogger *logrus.Logger
 
 type logFormatter struct {}
 
@@ -27,11 +28,17 @@ func NewLogger(filePath string) *logrus.Logger {
 		MaxSize: 10,
 		MaxBackups: 5,
 	}
+	fileRotateLogWriter.Rotate()
 	logger.SetFormatter(&logFormatter{})
 	logger.SetOutput(fileRotateLogWriter)
 	return logger
 }
 
 func GetLogger() *logrus.Logger {
-	return logger
+	return reqLogger
+}
+
+func Init(filePath string) {
+	reqLogger = NewLogger(filePath)
+	log.Printf("Initialized logfile %s", filePath)
 }

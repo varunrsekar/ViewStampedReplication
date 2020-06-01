@@ -1,15 +1,16 @@
 package viewmanager
 
 import (
-	"log"
+	"fmt"
+	"github.com/davecgh/go-spew/spew"
 	"sync"
-	"viewStampedReplication/server/clientrpc"
-	log2 "viewStampedReplication/server/log"
+	"viewStampedReplication/clientrpc"
+	log2 "viewStampedReplication/log"
 )
 
-type LockingRequest struct {
+type LockingRequests struct {
 	sync.Mutex
-	r clientrpc.Request
+	r map[int]clientrpc.Request
 }
 
 type StartViewRequest struct {
@@ -17,10 +18,11 @@ type StartViewRequest struct {
 	Ops      []log2.Operation
 	OpId     int
 	CommitId int
+	ReplicaId int
 }
 
-func (s *StartViewRequest) LogRequest() {
-	log.Printf("[StartViewRequest] Initiating request; req: %+v", s)
+func (s *StartViewRequest) LogRequest(recv bool) {
+	clientrpc.Log(fmt.Sprintf("[StartViewRequest] %s start view request; req: %+v", "%s", spew.NewFormatter(s)), recv)
 }
 
 type StartViewChangeRequest struct {
@@ -28,8 +30,8 @@ type StartViewChangeRequest struct {
 	View int
 }
 
-func (s *StartViewChangeRequest) LogRequest() {
-	log.Printf("[StartViewChangeRequest] Initiating request; req: %+v", s)
+func (s *StartViewChangeRequest) LogRequest(recv bool) {
+	clientrpc.Log(fmt.Sprintf("[StartViewChangeRequest] %s start view change request; req: %+v", "%s", spew.NewFormatter(s)), recv)
 }
 
 type DoViewChangeRequest struct {
@@ -38,8 +40,9 @@ type DoViewChangeRequest struct {
 	LatestNormalView int
 	OpId             int
 	CommitId         int
+	ReplicaId int
 }
 
-func (req *DoViewChangeRequest) LogRequest() {
-	log.Printf("[DoViewChangeRequest] Initiating DoViewChange; req: %+v", req)
+func (req *DoViewChangeRequest) LogRequest(recv bool) {
+	clientrpc.Log(fmt.Sprintf("[DoViewChangeRequest] %s do view change request; req: %+v", "%s", spew.NewFormatter(req)), recv)
 }

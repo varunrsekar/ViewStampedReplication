@@ -6,8 +6,9 @@ import (
 	"net"
 	"net/http"
 	"net/rpc"
-	"viewStampedReplication/server/clientrpc"
-	log2 "viewStampedReplication/server/log"
+	"viewStampedReplication/clientrpc"
+	"viewStampedReplication/common"
+	log2 "viewStampedReplication/log"
 	"viewStampedReplication/server/viewmanager"
 	"viewStampedReplication/server/viewreplication"
 )
@@ -15,32 +16,37 @@ import (
 var appImpl *Impl
 
 type Service interface {
-	Request(req *ClientRequest, res *ClientReply) error
+	Request(req *common.ClientRequest, res *common.ClientReply) error
 }
 
 type Impl struct {
 	*viewmanager.Impl
-	WorkQueue chan *ClientRequest
+	WorkQueue chan *common.ClientRequest
 }
 
 func GetImpl() *Impl {
 	return appImpl
 }
 
-func (impl *Impl) Request(req *ClientRequest, res *clientrpc.EmptyResponse) error {
-	req.LogRequest()
-	reply := &ClientReply{
+func (impl *Impl) Request(req *common.ClientRequest, res *clientrpc.EmptyResponse) error {
+	req.LogRequest(true)
+	reply := &common.ClientReply{
 		Res: nil,
 		Err: nil,
+		ReplicaId: impl.Config.Id,
 	}
 	c := impl.Config.GetClient(req.ClientId)
 	if !impl.IsClusterStatusNormal() {
-		reply.Err = fmt.Errorf("invalid operation status of cluster: %s", impl.GetClusterStatus())
+		var errStr = fmt.Sprintf("invalid operation status of cluster: %s", impl.GetClusterStatus())
+		reply.Err = &errStr
+		reply.LogRequest(false)
 		c.Do("Client.Reply", reply, &clientrpc.EmptyResponse{}, true)
 		return nil
 	}
 	if !impl.IsPrimary() {
-		reply.Err = fmt.Errorf("invalid operation status of host: %s", viewreplication.RoleBackup)
+		var errStr = fmt.Sprintf("invalid operation status of host: %s", viewreplication.RoleBackup)
+		reply.Err = &errStr
+		reply.LogRequest(false)
 		c.Do("Client.Reply", reply, &clientrpc.EmptyResponse{}, true)
 		return nil
 	}
@@ -52,12 +58,15 @@ func (impl *Impl) Request(req *ClientRequest, res *clientrpc.EmptyResponse) erro
 	lastResponse := clientState.LastResponse
 	if lastResponse != nil {
 		if req.RequestId < lastResponse.RequestId {
-			reply.Err = fmt.Errorf("stale request id detected")
+			var errStr = fmt.Sprintf("stale request id detected")
+			reply.Err = &errStr
+			reply.LogRequest(false)
 			c.Do("Client.Reply", reply, &clientrpc.EmptyResponse{}, true)
 			return nil
 		} else if req.RequestId == lastResponse.RequestId {
 			reply.Res = clientState.LastResponse
 			log.Printf("Request already executed; req: %v, res: %v", req, res)
+			reply.LogRequest(false)
 			c.Do("Client.Reply", reply, &clientrpc.EmptyResponse{}, true)
 			return nil
 		}
@@ -67,14 +76,13 @@ func (impl *Impl) Request(req *ClientRequest, res *clientrpc.EmptyResponse) erro
 	return nil
 }
 
-func (impl *Impl) BufferRequest(req *ClientRequest) {
+func (impl *Impl) BufferRequest(req *common.ClientRequest) {
 	impl.WorkQueue <- req
 }
 
 func (impl *Impl) ProcessClientRequests() {
 	for {
 		req := <-(impl.WorkQueue)
-		log.Printf("Received work request; req: %v", req)
 		opId := impl.AdvanceOpId()
 		op := impl.AppendOp(req, opId)
 		impl.UpdateClientState(req)
@@ -83,22 +91,29 @@ func (impl *Impl) ProcessClientRequests() {
 }
 
 func (impl *Impl) PrepareOk(req *viewreplication.PrepareOkRequest, res *clientrpc.EmptyResponse) error {
+	req.LogRequest(true)
 	if !impl.IsPrimary() {
 		log.Printf("Not primary. Ignoring request; req: %v", req)
 		return nil
 	}
-	for _, op := range impl.Ops {
-		if op.OpId == req.OpId {
-			op.Quorum[req.ReplicaId] = true
-			if op.IsQuorumSatisfied() {
-				result := op.Commit()
+	for i, _ := range impl.Ops {
+		// Don't process committed Ops.
+		if impl.Ops[i].Committed {
+			continue
+		}
+		if impl.Ops[i].OpId == req.OpId {
+			impl.Ops[i].Quorum[req.ReplicaId] = true
+			if impl.Ops[i].IsQuorumSatisfied() {
+				result := impl.Ops[i].Commit()
 				impl.AdvanceCommitId()
-				c := impl.Config.GetClient(op.Log.ClientId)
-				resp := impl.Impl.UpdateClientState(op.Log.ClientId, op.Log.RequestId, result)
-				reply := &ClientReply{
+				c := impl.Config.GetClient(impl.Ops[i].Log.ClientId)
+				resp := impl.Impl.UpdateClientState(impl.Ops[i].Log.ClientId, impl.Ops[i].Log.RequestId, result)
+				reply := &common.ClientReply{
 					Res: resp,
 					Err: nil,
+					ReplicaId: impl.Config.Id,
 				}
+				reply.LogRequest(false)
 				c.Do("Client.Reply", reply, &clientrpc.EmptyResponse{}, true)
 			}
 		}
@@ -106,7 +121,7 @@ func (impl *Impl) PrepareOk(req *viewreplication.PrepareOkRequest, res *clientrp
 	return nil
 }
 
-func (impl *Impl) AppendOp(req *ClientRequest, opId int) log2.Operation {
+func (impl *Impl) AppendOp(req *common.ClientRequest, opId int) log2.Operation {
 	logMsg := log2.LogMessage{
 		ClientId:  req.ClientId,
 		RequestId: req.RequestId,
@@ -115,7 +130,7 @@ func (impl *Impl) AppendOp(req *ClientRequest, opId int) log2.Operation {
 	return impl.Impl.AppendOp(opId, logMsg)
 }
 
-func (impl *Impl) UpdateClientState(req *ClientRequest) *viewreplication.OpResponse {
+func (impl *Impl) UpdateClientState(req *common.ClientRequest) *viewreplication.OpResponse {
 	return impl.Impl.UpdateClientState(req.ClientId, req.RequestId, nil)
 }
 
@@ -127,18 +142,19 @@ func Init() {
 	viewmanager.Init()
 	appImpl = &Impl{
 		Impl: viewmanager.GetImpl(),
-		WorkQueue:       make(chan *ClientRequest, clientrpc.MaxRequests),
+		WorkQueue:       make(chan *common.ClientRequest, clientrpc.MaxRequests),
 	}
 	rpc.RegisterName("Application", appImpl)
-	log.Print("App initialization successful")
 	go appImpl.ProcessClientRequests()
 	rpc.HandleHTTP()
-	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", appImpl.Config.Self.GetPort()))
+	listener, err := net.Listen("tcp", fmt.Sprintf("localhost:%d", appImpl.Config.Self.GetPort()))
 	if err != nil {
 		log.Fatal("Listen error: ", err)
 	}
+	log.Printf("Listening on port %d", appImpl.Config.Self.GetPort())
 	err = http.Serve(listener, nil)
 	if err != nil {
 		log.Fatal("Error serving: ", err)
 	}
+	log.Print("App initialization successful")
 }

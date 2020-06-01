@@ -1,7 +1,9 @@
 package viewreplication
 
 import (
-	"viewStampedReplication/server/clientrpc"
+	"fmt"
+	"log"
+	"viewStampedReplication/clientrpc"
 )
 
 type Status int
@@ -44,67 +46,80 @@ func (r Role) String() string {
 type Configuration struct {
 	Id int
 	Self *Replica
-	replicas map[int]*Replica
+	replicas map[int]Replica
 	primary bool
 	QuorumSize int
-	clients map[string]*Client
+	clients map[string]Client
 }
 
 func (c *Configuration) IsPrimary() bool {
-	return c.primary
+	return c.Self.IsPrimary()
 }
 
-func (c *Configuration) SetPrimary() {
-	c.primary = true
-	c.Self.SetPrimary()
+func (c *Configuration) SetPrimary(id int, self bool) {
+	if self {
+		c.primary = true
+		c.Self.SetPrimary()
+	} else {
+		c.primary = false
+		c.Self.SetBackup()
+	}
+	for i, _  := range c.replicas {
+		if c.replicas[i].Id == id {
+			c.replicas[i] = NewReplica(id, c.replicas[i].port, RolePrimary)
+		} else {
+			c.replicas[i] = NewReplica(c.replicas[i].Id, c.replicas[i].port, RoleBackup)
+		}
+	}
 }
 
-func (c *Configuration) SetBackup() {
-	c.primary = false
-	c.Self.SetBackup()
-}
-
-func (c *Configuration) GetClient(id string) *Client {
+func (c *Configuration) GetClient(id string) Client {
 	return c.clients[id]
 }
 
 type Replica struct {
-	Id int
+	Id   int
 	c    clientrpc.Client
-	role Role
+	Role Role
 	port int
 }
 
 func (r *Replica) IsPrimary() bool {
-	if r.role == RolePrimary {
+	if r.Role == RolePrimary {
 		return true
 	}
 	return false
 }
 
 func (r *Replica) SetPrimary() {
-	r.role = RolePrimary
+	r.Role = RolePrimary
+	log.Printf("Changed Role for replica %d to Primary", r.Id)
 }
 
 func (r *Replica) SetBackup() {
-	r.role = RoleBackup
+	r.Role = RoleBackup
+	log.Printf("Changed Role for replica %d to Backup", r.Id)
 }
 
-func NewReplica(id int, client clientrpc.Client, port int, role Role) *Replica {
-	return &Replica{
+func NewReplica(id int, port int, role Role) Replica {
+	return Replica{
 		Id: id,
-		c: client,
+		c: clientrpc.Client{
+			Hostname: fmt.Sprintf("localhost:%d", port),
+		},
 		port: port,
-		role: role,
+		Role: role,
 	}
 }
 
-func(r *Replica) Do(api string, req clientrpc.Request, res clientrpc.Response, async bool) {
+func(r *Replica) Do(api string, req clientrpc.Request, res clientrpc.Response, async bool) error {
+	var err error
 	if async {
-		r.c.AsyncDo(api, req, res)
+		err = r.c.AsyncDo(api, req, res)
 	} else {
-		r.c.Do(api, req, res)
+		err = r.c.Do(api, req, res)
 	}
+	return err
 }
 
 func (r *Replica) GetPort() int {
@@ -112,16 +127,18 @@ func (r *Replica) GetPort() int {
 }
 
 type Client struct {
-	Id string
+	Id   string
 	port int
-	c clientrpc.Client
+	c    clientrpc.Client
 }
 
-func NewClient(id string, client clientrpc.Client, port int) *Client {
-	return &Client{
+func NewClient(id string, port int) Client {
+	return Client{
 		Id:   id,
 		port: port,
-		c:    client,
+		c:    clientrpc.Client{
+			Hostname: fmt.Sprintf("localhost:%d", port),
+		},
 	}
 }
 
