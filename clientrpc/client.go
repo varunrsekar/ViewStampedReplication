@@ -91,6 +91,7 @@ func (client *Client) Do(api string, req Request, res Response) error {
 	err := client.c.Call(api, req, res)
 	if err != nil {
 		log.Printf("[error] Received error from RPC request; api: %s, req: %s, err: %v", api, req, err)
+		err = client.c.Call(api, req, res)
 		return err
 	}
 	return nil
@@ -103,6 +104,7 @@ func (client *Client) AsyncDo(api string, req Request, res Response) error {
 	call := client.c.Go(api, req, res, nil)
 	if call.Error != nil {
 		log.Printf("Received error from async RPC request; api: %s, req: %v, err: %v", api, req, call.Error)
+		call = client.c.Go(api, req, res, nil)
 		return call.Error
 	}
 	return nil

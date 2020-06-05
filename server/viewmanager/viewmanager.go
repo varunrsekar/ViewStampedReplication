@@ -105,6 +105,7 @@ func (impl *Impl) SendDoViewChangeRequest() {
 				OpId:             impl.OpId,
 				CommitId:         impl.CommitId,
 				ReplicaId:        impl.Config.Id,
+				DestId: newPrimary,
 			}
 			doViewChangeReq.LogRequest(false)
 			log.Printf("Sending DoViewChangeRequest to replica; replica: %d, req: %+v", replicas[i].Id, doViewChangeReq)
@@ -115,6 +116,7 @@ func (impl *Impl) SendDoViewChangeRequest() {
 	impl.sentDoViewChange[impl.View] = true
 }
 
+// findNewPrimary selects new primary in a round-robin fashion.
 func (impl *Impl) findNewPrimary() int {
 	currPrimary := impl.GetPrimary()
 	newPrimary := currPrimary.Id + 1
@@ -187,16 +189,17 @@ func (impl *Impl) ProcessDoViewChangeRequests() {
 			// Clear pending view change request as its done.
 			impl.pendingViewChangeRequests.r = make(map[int]clientrpc.Request)
 			// Send StartView requests to replicas.
-			startViewReq := &StartViewRequest{
-				View:     impl.View,
-				Ops:      impl.Ops,
-				OpId:     impl.OpId,
-				CommitId: impl.CommitId,
-				ReplicaId: impl.Config.Id,
-			}
-			startViewReq.LogRequest(false)
 			replicas := impl.GetOtherReplicas()
 			for i, _ := range replicas {
+				startViewReq := &StartViewRequest{
+					View:     impl.View,
+					Ops:      impl.Ops,
+					OpId:     impl.OpId,
+					CommitId: impl.CommitId,
+					ReplicaId: impl.Config.Id,
+					DestId: replicas[i].Id,
+				}
+				startViewReq.LogRequest(false)
 				replicas[i].Do("ViewManager.StartView", startViewReq, &clientrpc.EmptyResponse{}, true)
 			}
 			// Start sending commit requests after half the time.
@@ -227,15 +230,16 @@ func (impl *Impl) StartView(req *StartViewRequest, res *clientrpc.EmptyResponse)
 	impl.UpdateClientState(lastOp.Log.ClientId, lastOp.Log.RequestId, lastOp.Result)
 	for _, op := range impl.Ops {
 		if op.Result == nil {
-			// send PrepareOk messages for non-committed ops.
+			primary := impl.GetPrimary()
+			// send PrepareOk messages for non-committed ops to primary.
 			req := &viewreplication.PrepareOkRequest{
 				View:      impl.View,
 				OpId:      op.OpId,
 				ReplicaId: impl.Config.Id,
+				DestId: primary.Id,
 			}
 			req.LogRequest(false)
-			replica := impl.GetPrimary()
-			(&replica).Do("Application.PrepareOk", req, &clientrpc.EmptyResponse{}, true)
+			(&primary).Do("Application.PrepareOk", req, &clientrpc.EmptyResponse{}, true)
 		}
 	}
 	impl.ActivityTimer.Reset(impl.ActivityTimeout)
@@ -250,6 +254,7 @@ func (impl *Impl) GetState(req *viewreplication.GetStateRequest, res *viewreplic
 			CommitId:  -1,
 			Ops:       make([]log2.Operation, 0),
 			ReplicaId: impl.Config.Id,
+			DestId: req.ReplicaId,
 		}
 		log.Printf("Ignoring GetStateRequest due to invalid cluster status; status: %s", impl.ClusterStatus)
 		return nil
@@ -262,6 +267,7 @@ func (impl *Impl) GetState(req *viewreplication.GetStateRequest, res *viewreplic
 			CommitId:  vrRes.CommitId,
 			Ops:       vrRes.Ops,
 			ReplicaId: vrRes.ReplicaId,
+			DestId: req.ReplicaId,
 		}
 	}
 	res.LogResponse(false)
@@ -270,19 +276,20 @@ func (impl *Impl) GetState(req *viewreplication.GetStateRequest, res *viewreplic
 
 func (impl *Impl) SendPrepareMessages(clientId string, requestId int, op log2.Operation) {
 	impl.ActivityTimer.Reset(impl.ActivityTimeout)
-	req := &viewreplication.PrepareRequest{
-	 	ClientId: clientId,
-	 	RequestId: requestId,
-		View: impl.View,
-		OpId: op.OpId,
-		Log: op.Log,
-		CommitId: op.OpId,
-		ReplicaId: impl.Config.Id,
-	}
-	req.LogRequest(false)
 	backups := impl.GetOtherReplicas()
 	log.Printf("backups: %+v", spew.NewFormatter(backups))
 	for i, _ := range backups {
+		req := &viewreplication.PrepareRequest{
+			ClientId: clientId,
+			RequestId: requestId,
+			View: impl.View,
+			OpId: op.OpId,
+			Log: op.Log,
+			CommitId: impl.CommitId,
+			ReplicaId: impl.Config.Id,
+			DestId: backups[i].Id,
+		}
+		req.LogRequest(false)
 		backups[i].Do("ViewReplication.Prepare", req, &clientrpc.EmptyResponse{}, true)
 	}
 }
@@ -309,17 +316,19 @@ func (impl *Impl) SendStartViewChangeRequests() {
 	if impl.sentStartViewChange[impl.View] {
 		return
 	}
+	if impl.pendingViewChangeRequests.r[impl.Config.Id] != nil && impl.pendingViewChangeRequests.r[impl.Config.Id].(*StartViewChangeRequest).View == impl.View {
+		return
+	}
 	req := &StartViewChangeRequest{
 		ReplicaId: impl.Config.Id,
 		View:      impl.View,
-	}
-	if impl.pendingViewChangeRequests.r[impl.Config.Id] != nil && impl.pendingViewChangeRequests.r[impl.Config.Id].(*StartViewChangeRequest).View == impl.View {
-		return
+		DestId: -1,
 	}
 	impl.pendingViewChangeRequests.r[impl.Config.Id] = req
 	replicas := impl.GetOtherReplicas()
 	for i, _ := range replicas {
 		log.Printf("Sending StartViewChange request to replica; replica: %d, req: %v", replicas[i].Id, req)
+		req.DestId = replicas[i].Id
 		req.LogRequest(false)
 		replicas[i].Do("ViewManager.StartViewChange", req, &clientrpc.EmptyResponse{}, true)
 	}
@@ -345,6 +354,7 @@ func (impl *Impl) MonitorActivity() {
 					View:     impl.View,
 					CommitId: impl.CommitId,
 					ReplicaId: impl.Config.Id,
+					DestId: backups[i].Id,
 				}
 				commitReq.LogRequest(false)
 				backups[i].Do("ViewReplication.Commit", commitReq, &clientrpc.EmptyResponse{}, true)
@@ -373,6 +383,7 @@ func (impl *Impl) WaitForCluster() {
 				View:     impl.View,
 				CommitId: impl.CommitId,
 				ReplicaId: impl.Config.Id,
+				DestId: backups[i].Id,
 			}
 			commitReq.LogRequest(false)
 			err = backups[i].Do("ViewReplication.Commit", commitReq, nil, true)

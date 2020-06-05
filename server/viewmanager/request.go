@@ -19,6 +19,7 @@ type StartViewRequest struct {
 	OpId     int
 	CommitId int
 	ReplicaId int
+	DestId int
 }
 
 func (s *StartViewRequest) LogRequest(recv bool) {
@@ -28,6 +29,7 @@ func (s *StartViewRequest) LogRequest(recv bool) {
 type StartViewChangeRequest struct {
 	ReplicaId int
 	View int
+	DestId int
 }
 
 func (s *StartViewChangeRequest) LogRequest(recv bool) {
@@ -41,6 +43,7 @@ type DoViewChangeRequest struct {
 	OpId             int
 	CommitId         int
 	ReplicaId int
+	DestId int
 }
 
 func (req *DoViewChangeRequest) LogRequest(recv bool) {

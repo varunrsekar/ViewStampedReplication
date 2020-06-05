@@ -2,6 +2,7 @@ package viewreplication
 
 import (
 	"bytes"
+	"fmt"
 	"github.com/davecgh/go-spew/spew"
 	"log"
 	"math/rand"
@@ -55,7 +56,10 @@ func (impl *Impl) Prepare(req *PrepareRequest, res *clientrpc.EmptyResponse) err
 	impl.SetPrimaryReqRecvd(true)
 	workReq := impl.BufferPrepareRequest(req)
 	workReq.GetWG().Wait()
-	return nil
+	if workReq.GetResult() != nil {
+		return nil
+	}
+	return fmt.Errorf("prepare failed for req %v", req)
 }
 
 func (impl *Impl) BufferPrepareRequest(req *PrepareRequest) *clientrpc.WorkRequest {
@@ -72,12 +76,17 @@ func (impl *Impl) ProcessPrepareRequests() {
 	for {
 		workReq := <-(impl.PrepareQueue)
 		if impl.IsPrimary() {
+			workReq.SetResult(nil)
+			workReq.GetWG().Done()
 			continue
 		}
 		req := workReq.GetRequest().(*PrepareRequest)
 		currOpId := impl.OpId
 		if req.OpId <= currOpId {
-			log.Fatalf("Received invalid OpId in request; req: %v", req)
+			log.Printf("[error] Received invalid OpId in request; req: %v", req)
+			workReq.SetResult(nil)
+			workReq.GetWG().Done()
+			continue
 		} else if req.OpId > currOpId+1 {
 			impl.WaitForStateTransfer(req.View)
 		}
@@ -87,14 +96,16 @@ func (impl *Impl) ProcessPrepareRequests() {
 		impl.AdvanceOpId()
 		impl.AppendOp(req.OpId, req.Log)
 		impl.UpdateClientState(req.ClientId, req.RequestId, nil)
+		primary := impl.GetPrimary()
 		okReq := &PrepareOkRequest{
 			View:      impl.View,
 			OpId:      req.OpId,
 			ReplicaId: impl.Config.Id,
+			DestId: primary.Id,
 		}
 		okReq.LogRequest(false)
-		replica := impl.GetPrimary()
-		(&replica).Do("Application.PrepareOk", okReq, &clientrpc.EmptyResponse{}, true)
+		workReq.SetResult(&clientrpc.EmptyResponse{})
+		(&primary).Do("Application.PrepareOk", okReq, &clientrpc.EmptyResponse{}, true)
 		workReq.GetWG().Done()
 	}
 }
@@ -129,17 +140,19 @@ func (impl *Impl) ProcessCommitRequests() {
 		}
 		req := workReq.GetRequest().(*CommitRequest)
 		currOpId := impl.OpId
+		if req.CommitId == impl.CommitId {
+			continue
+		}
 		if req.CommitId > currOpId {
 			impl.WaitForStateTransfer(req.View)
 		}
 		for i, _ := range impl.Ops {
 			if req.CommitId == impl.Ops[i].OpId {
 				if impl.Ops[i].Committed {
-					log.Printf("Operation already committed: %+v", spew.NewFormatter(impl.Ops[i]))
 					break
 				}
 				result := impl.Ops[i].Commit()
-				impl.AdvanceCommitId()
+				impl.CommitId = req.CommitId
 				impl.UpdateClientState(impl.Ops[i].Log.ClientId, impl.Ops[i].Log.RequestId, result)
 			}
 		}
@@ -163,6 +176,7 @@ func (impl *Impl) GetState(req *GetStateRequest) *NewStateResponse {
 		CommitId: impl.CommitId,
 		Ops:      ops,
 		ReplicaId: impl.Config.Id,
+		DestId: req.ReplicaId,
 	}
 	return res
 }
@@ -171,12 +185,6 @@ func (impl *Impl) WaitForStateTransfer(view int) {
 	if view >= impl.View {
 		impl.OpId = impl.CommitId
 		impl.ClearOpsAfterOpId()
-		getStateReq := &GetStateRequest{
-			View:      view,
-			OpId:      impl.OpId,
-			ReplicaId: impl.Config.Id,
-		}
-		getStateReq.LogRequest(false)
 		replicas := impl.GetOtherReplicas()
 		for i, _ := range replicas {
 			var done chan bool
@@ -186,7 +194,15 @@ func (impl *Impl) WaitForStateTransfer(view int) {
 				CommitId:  -1,
 				Ops:       nil,
 				ReplicaId: replicas[i].Id,
+				DestId: impl.Config.Id,
 			}
+			getStateReq := &GetStateRequest{
+				View:      view,
+				OpId:      impl.OpId,
+				ReplicaId: impl.Config.Id,
+				DestId: replicas[i].Id,
+			}
+			getStateReq.LogRequest(false)
 			go func() {
 				replicas[i].Do("ViewManager.GetState", getStateReq, res, false)
 				res.LogResponse(true)
@@ -212,12 +228,12 @@ func (impl *Impl) WaitForStateTransfer(view int) {
 
 func (impl *Impl) DoPendingCommits(commitId int) {
 	for i, _  := range impl.Ops {
-		if impl.Ops[i].OpId < impl.CommitId || impl.Ops[i].OpId > commitId {
+		if impl.Ops[i].OpId <= impl.CommitId || impl.Ops[i].OpId > commitId {
 			continue
 		}
 		impl.Ops[i].Committed = false
 		result := impl.Ops[i].Commit()
-		impl.AdvanceCommitId()
+		impl.CommitId = impl.Ops[i].OpId
 		impl.UpdateClientState(impl.Ops[i].Log.ClientId, impl.Ops[i].Log.RequestId, result)
 	}
 }
@@ -238,11 +254,6 @@ func (impl *Impl) ClearOpsAfterOpId() {
 func (impl *Impl) AdvanceOpId() int {
 	impl.OpId += 1
 	return impl.OpId
-}
-
-func (impl *Impl) AdvanceCommitId() int {
-	impl.CommitId += 1
-	return impl.CommitId
 }
 
 func (impl *Impl) AppendOp(opId int, logMsg log2.LogMessage) log2.Operation {
@@ -349,6 +360,7 @@ func (impl *Impl) Recovery(req *RecoveryRequest, res *RecoveryResponse) error {
 			OpId:      -1,
 			CommitId:  -2,
 			ReplicaId: impl.Config.Id,
+			DestId: req.ReplicaId,
 		}
 		res.LogResponse(false)
 		return nil
@@ -361,42 +373,52 @@ func (impl *Impl) Recovery(req *RecoveryRequest, res *RecoveryResponse) error {
 		OpId:      impl.OpId,
 		CommitId:  impl.CommitId,
 		ReplicaId: impl.Config.Id,
+		DestId: req.ReplicaId,
 	}
 	res.LogResponse(false)
 	return nil
 }
 
-func (impl *Impl) SendRecoveryRequests(req *RecoveryRequest) chan *RecoveryResponse {
+func (impl *Impl) SendRecoveryRequests(nonce []byte) chan *RecoveryResponse {
 	done := make(chan *RecoveryResponse)
 	replicas := impl.GetOtherReplicas()
 	var idx int
 	for i, _ := range replicas {
 		idx = i
 		go func(idx int) {
+			req := &RecoveryRequest{
+				Nonce:     nonce,
+				ReplicaId: vrImpl.Config.Id,
+				DestId:    replicas[idx].Id,
+			}
 			log.Printf("Sending recovery request to replica %d; req: %+v", replicas[idx].Id, req)
 			req.LogRequest(false)
 			res := &RecoveryResponse{
 				View:      -1,
 				Ops:       nil,
-				Nonce:     nil,
+				Nonce:     nonce,
 				OpId:      -1,
 				CommitId:  -1,
 				ReplicaId: replicas[idx].Id,
+				DestId: impl.Config.Id,
 			}
-			replicas[idx].Do("ViewManager.Recovery", req, res, false)
+			err := replicas[idx].Do("ViewManager.Recovery", req, res, false)
+			if err != nil {
+				return
+			}
 			done <- res
 		}(idx)
 	}
 	return done
 }
 
-func (impl *Impl) WaitForRecoveryQuorum(req *RecoveryRequest, done chan *RecoveryResponse) *RecoveryResponse {
+func (impl *Impl) WaitForRecoveryQuorum(nonce []byte, done chan *RecoveryResponse) *RecoveryResponse {
 	var quorum int
 	var primaryResponse *RecoveryResponse
 	for quorum < impl.GetQuorumSize() {
 		res := <- done
 		if res != nil {
-			if bytes.Equal(req.Nonce, res.Nonce) {
+			if bytes.Equal(nonce, res.Nonce) {
 				res.LogResponse(true)
 				// CommitId is -2 for backups and set for primary.
 				if res.CommitId != -2 {
@@ -408,7 +430,7 @@ func (impl *Impl) WaitForRecoveryQuorum(req *RecoveryRequest, done chan *Recover
 					quorum -= 1
 				}
 			} else {
-				log.Printf("[RecoveryQuorum] Received response for a different recovery request; reqNonce: %v, resNonce: %v", req.Nonce, res.Nonce)
+				log.Printf("[RecoveryQuorum] Received response for a different recovery request; reqNonce: %v, resNonce: %v", nonce, res.Nonce)
 			}
 		}
 	}
@@ -519,19 +541,15 @@ func Init() {
 	}
 	log.Printf("[INFO] ViewReplication Config: %+v", config)
 	if vrImpl.ClusterStatus == StatusRecover {
-		// If we're in recovery mode, run the Recovery protocol.
+		// Create unique nonce for the request.
 		nonce := make([]byte, 12)
 		if _, err := rand.Read(nonce); err != nil {
 			panic(err.Error())
 		}
-		req := &RecoveryRequest{
-			Nonce:     nonce,
-			ReplicaId: vrImpl.Config.Id,
-		}
 		// Send recovery request to all replicas.
-		done := vrImpl.SendRecoveryRequests(req)
+		done := vrImpl.SendRecoveryRequests(nonce)
 		// Wait for quorum to be reached and for primary to respond.
-		res := vrImpl.WaitForRecoveryQuorum(req, done)
+		res := vrImpl.WaitForRecoveryQuorum(nonce, done)
 		// Update configuration with current state of the cluster.
 		vrImpl.UpdatePrimaryNode(res.ReplicaId)
 		vrImpl.View = res.View

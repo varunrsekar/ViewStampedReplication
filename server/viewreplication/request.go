@@ -16,16 +16,29 @@ type PrepareRequest struct {
 	OpId      int
 	CommitId  int
 	ReplicaId int
+	DestId int
 }
 
 func (req *PrepareRequest) LogRequest(recv bool) {
 	clientrpc.Log(fmt.Sprintf("[PrepareRequest] %s prepare request: %v", "%s", spew.NewFormatter(req)), recv)
 }
 
+type PrepareOkRequest struct {
+	View int
+	OpId int
+	ReplicaId int
+	DestId int
+}
+
+func (req *PrepareOkRequest) LogRequest(recv bool) {
+	clientrpc.Log(fmt.Sprintf("[PrepareOkRequest] %s prepare ok request: %+v", "%s", spew.NewFormatter(req)), recv)
+}
+
 type CommitRequest struct {
 	View int
 	CommitId int
 	ReplicaId int
+	DestId int
 }
 
 func (req *CommitRequest) LogRequest(recv bool) {
@@ -36,6 +49,7 @@ type GetStateRequest struct {
 	View int
 	OpId int
 	ReplicaId int
+	DestId int
 }
 
 func (req *GetStateRequest) LogRequest(recv bool) {
@@ -48,6 +62,7 @@ type NewStateResponse struct {
 	CommitId int
 	Ops []log2.Operation
 	ReplicaId int
+	DestId int
 }
 
 func (res *NewStateResponse) LogResponse(recv bool) {
@@ -67,6 +82,7 @@ func (or *OpResponse) LogResponse(recv bool) {
 type RecoveryRequest struct {
 	Nonce []byte
 	ReplicaId int
+	DestId int
 }
 
 func (req *RecoveryRequest) LogRequest(recv bool) {
@@ -80,18 +96,9 @@ type RecoveryResponse struct {
 	OpId      int
 	CommitId  int
 	ReplicaId int
+	DestId int
 }
 
 func (res *RecoveryResponse) LogResponse(recv bool) {
 	clientrpc.Log(fmt.Sprintf("[RecoveryResponse] %s recovery response; res: %+v", "%s", spew.NewFormatter(res)), recv)
-}
-
-type PrepareOkRequest struct {
-	View int
-	OpId int
-	ReplicaId int
-}
-
-func (req *PrepareOkRequest) LogRequest(recv bool) {
-	clientrpc.Log(fmt.Sprintf("[PrepareOkRequest] %s prepare ok request: %+v", "%s", spew.NewFormatter(req)), recv)
 }

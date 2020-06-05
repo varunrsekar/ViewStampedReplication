@@ -14,7 +14,7 @@ var opLogger *logrus.Logger
 
 type OpResult struct {
 	Val *string
-	Err error
+	Err *string
 }
 
 type Message struct {
@@ -54,7 +54,6 @@ func (op *Operation) Commit() *OpResult {
 	opLogger.Infof("%+v", spew.NewFormatter(op))
 	var err error
 	var val string
-	var resVal *string
 	switch msg.Action {
 	case "CREATE":
 		err = store.Get().Create(msg.Key, *msg.Val)
@@ -66,12 +65,18 @@ func (op *Operation) Commit() *OpResult {
 		err = store.Get().Update(msg.Key, *msg.Val)
 	}
 	if err == nil {
-		resVal = &val
+		op.Result = &OpResult{
+			Val: &val,
+			Err: nil,
+		}
+	} else {
+		var errStr = err.Error()
+		op.Result = &OpResult{
+			Val: nil,
+			Err: &errStr,
+		}
 	}
-	op.Result = &OpResult{
-		Val: resVal,
-		Err: err,
-	}
+
 	op.Committed = true
 	return op.Result
 }
@@ -92,5 +97,5 @@ func (op Operation) String() string {
 
 func Init(id string) {
 	opLogger = logger.NewLogger(fmt.Sprintf("op-%s.log", id))
-	opLogger.Info("OpId ClientId RequestId Key (Val)")
+	opLogger.Info("OpId ClientId RequestId Action Key (Val)")
 }

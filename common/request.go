@@ -8,10 +8,12 @@ import (
 	"viewStampedReplication/server/viewreplication"
 )
 
+
 type ClientRequest struct {
 	Op        log2.Message
 	ClientId  string
 	RequestId int
+	DestId int
 }
 
 func (req *ClientRequest) LogRequest(recv bool) {
@@ -22,6 +24,7 @@ type ClientReply struct {
 	Res *viewreplication.OpResponse
 	Err *string
 	ReplicaId int
+	DestId string
 }
 
 func (req *ClientReply) LogRequest(recv bool) {

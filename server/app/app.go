@@ -34,6 +34,7 @@ func (impl *Impl) Request(req *common.ClientRequest, res *clientrpc.EmptyRespons
 		Res: nil,
 		Err: nil,
 		ReplicaId: impl.Config.Id,
+		DestId: req.ClientId,
 	}
 	c := impl.Config.GetClient(req.ClientId)
 	if !impl.IsClusterStatusNormal() {
@@ -105,13 +106,14 @@ func (impl *Impl) PrepareOk(req *viewreplication.PrepareOkRequest, res *clientrp
 			impl.Ops[i].Quorum[req.ReplicaId] = true
 			if impl.Ops[i].IsQuorumSatisfied() {
 				result := impl.Ops[i].Commit()
-				impl.AdvanceCommitId()
+				impl.CommitId = req.OpId
 				c := impl.Config.GetClient(impl.Ops[i].Log.ClientId)
 				resp := impl.Impl.UpdateClientState(impl.Ops[i].Log.ClientId, impl.Ops[i].Log.RequestId, result)
 				reply := &common.ClientReply{
 					Res: resp,
 					Err: nil,
 					ReplicaId: impl.Config.Id,
+					DestId: c.Id,
 				}
 				reply.LogRequest(false)
 				c.Do("Client.Reply", reply, &clientrpc.EmptyResponse{}, true)
