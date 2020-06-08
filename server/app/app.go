@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/http"
 	"net/rpc"
+
 	"viewStampedReplication/clientrpc"
 	"viewStampedReplication/common"
 	log2 "viewStampedReplication/log"
@@ -13,7 +14,12 @@ import (
 	"viewStampedReplication/server/viewreplication"
 )
 
+const (
+	indexHTML string = "server/ui/index.html"
+)
+
 var appImpl *Impl
+var rpcServer *rpc.Server
 
 type Service interface {
 	Request(req *common.ClientRequest, res *common.ClientReply) error
@@ -22,10 +28,6 @@ type Service interface {
 type Impl struct {
 	*viewmanager.Impl
 	WorkQueue chan *common.ClientRequest
-}
-
-func GetImpl() *Impl {
-	return appImpl
 }
 
 func (impl *Impl) Request(req *common.ClientRequest, res *clientrpc.EmptyResponse) error {
@@ -37,6 +39,7 @@ func (impl *Impl) Request(req *common.ClientRequest, res *clientrpc.EmptyRespons
 		DestId: req.ClientId,
 	}
 	c := impl.Config.GetClient(req.ClientId)
+	// Ignore requests if we're in view-change or recovery mode.
 	if !impl.IsClusterStatusNormal() {
 		var errStr = fmt.Sprintf("invalid operation status of cluster: %s", impl.GetClusterStatus())
 		reply.Err = &errStr
@@ -44,6 +47,7 @@ func (impl *Impl) Request(req *common.ClientRequest, res *clientrpc.EmptyRespons
 		c.Do("Client.Reply", reply, &clientrpc.EmptyResponse{}, true)
 		return nil
 	}
+	// Ignore requests if this is a backup.
 	if !impl.IsPrimary() {
 		var errStr = fmt.Sprintf("invalid operation status of host: %s", viewreplication.RoleBackup)
 		reply.Err = &errStr
@@ -53,6 +57,8 @@ func (impl *Impl) Request(req *common.ClientRequest, res *clientrpc.EmptyRespons
 	}
 
 	clientState := impl.GetClientState(req.ClientId)
+
+	// Create client state if this is the first request from it.
 	if clientState == nil {
 		clientState = impl.CreateClientState(req.ClientId)
 	}
@@ -71,14 +77,16 @@ func (impl *Impl) Request(req *common.ClientRequest, res *clientrpc.EmptyRespons
 			c.Do("Client.Reply", reply, &clientrpc.EmptyResponse{}, true)
 			return nil
 		}
+	} else if req.RequestId <= clientState.RequestId {
+		var errStr = fmt.Sprintf("stale request id detected")
+		reply.Err = &errStr
+		reply.LogRequest(false)
+		c.Do("Client.Reply", reply, &clientrpc.EmptyResponse{}, true)
+		return nil
 	}
 	// Add request to queue to be processed in viewreplication package
-	impl.BufferRequest(req)
-	return nil
-}
-
-func (impl *Impl) BufferRequest(req *common.ClientRequest) {
 	impl.WorkQueue <- req
+	return nil
 }
 
 func (impl *Impl) ProcessClientRequests() {
@@ -136,27 +144,26 @@ func (impl *Impl) UpdateClientState(req *common.ClientRequest) *viewreplication.
 	return impl.Impl.UpdateClientState(req.ClientId, req.RequestId, nil)
 }
 
-func GetApp() *Impl {
-	return appImpl
-}
-
 func Init() {
-	viewmanager.Init()
+	rpcServer = rpc.NewServer()
+	viewmanager.Init(rpcServer)
 	appImpl = &Impl{
 		Impl: viewmanager.GetImpl(),
 		WorkQueue:       make(chan *common.ClientRequest, clientrpc.MaxRequests),
 	}
-	rpc.RegisterName("Application", appImpl)
+	rpcServer.RegisterName("Application", appImpl)
 	go appImpl.ProcessClientRequests()
-	rpc.HandleHTTP()
+	rpcServer.HandleHTTP("/rpc", "/debug")
 	listener, err := net.Listen("tcp", fmt.Sprintf("localhost:%d", appImpl.Config.Self.GetPort()))
 	if err != nil {
 		log.Fatal("Listen error: ", err)
 	}
 	log.Printf("Listening on port %d", appImpl.Config.Self.GetPort())
-	err = http.Serve(listener, nil)
+	log.Print("App initialization successful")
+	handler := http.NewServeMux()
+	handler.HandleFunc("/", indexHandler)
+	err = http.Serve(listener, handler)
 	if err != nil {
 		log.Fatal("Error serving: ", err)
 	}
-	log.Print("App initialization successful")
 }

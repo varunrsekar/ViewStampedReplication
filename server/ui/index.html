@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <style>
+        .container {
+            width: auto;
+            /*background-color: #ffcc33;*/
+            margin: auto;
+            float: left;
+        }
+        #c2, #c3 {
+            clear: left;
+        }
+        #c3 {
+            clear: left;
+        }
+        .box {
+            width: auto;
+            float: left;
+            height: 200px;
+            border: 1px solid black;
+            margin-left: 5px;
+        }
+        .client {
+            background-color: #ffcc33;
+        }
+        .Primary {
+            background-color: #6aa774;
+        }
+        .Backup {
+            background-color: rgba(116, 116, 232, 0.8);
+        }
+        .box ul {
+            list-style-type: none
+        }
+        .dot {
+            height: 10px;
+            width: 10px;
+            background-color: #bbb;
+            border-radius: 50%;
+            display: inline-block;
+        }
+        .redBG {
+            background-color: red;
+        }
+        .redCol {
+            color: red;
+        }
+        .greenBG {
+            background-color: greenyellow;
+        }
+        .greenCol {
+            color: green;
+        }
+    </style>
+    <title>Fault-Tolerant KeyValueStore using ViewStampedReplication: {{ .Title }}</title>
+</head>
+<body>
+{{$this := .}}
+<div style="text-align: center"><h1>ViewStampedReplication</h1></div>
+<div><h1>Nodes</h1></div>
+<div class="container" id="c1">
+    {{range $key, $value := $this.App.Config.Replicas}}
+    <div class="{{ $value.Role }} box">
+            <table>
+                <tr><td>Replica ID:</td>
+                    <td>{{ $value.Id }}</td></tr>
+                <tr><td>Role: </td><td>{{ $value.Role }}</td></tr>
+                {{ if (eq $this.App.Config.Id $value.Id) }}
+                    <tr><td>Status: </td><td>{{ $this.App.ClusterStatus }}</td></tr>
+                    <tr><td>View: </td><td>{{ $this.App.View }}</td></tr>
+                    <tr><td>OpID: </td><td>{{ $this.App.OpId }}</td></tr>
+                    <tr><td>CommitID: </td><td>{{ $this.App.CommitId }}</td></tr>
+                {{ else }}
+                <tr><td>Connection: </td>
+                    {{ if $value.IsConnected }}
+                        <td>Online <span class="greenBG dot"></span></td>
+                    {{ else }}
+                        <td>Offline <span class="redBG dot"></span></td>
+                    {{ end }}
+                </tr>
+                {{ end }}
+            </table>
+    </div>
+    {{ end }}
+</div>
+<div id="c3"><h1>Clients</h1></div>
+<div class="container" id="c2">
+    {{range $key, $value := $this.App.ClientStates}}
+    <div class="client box">
+        <table>
+            <tr><td>Client ID:</td>
+            <td>{{ $key }}</td></tr>
+            <tr><td>Current RequestID: </td>
+                <td>{{ $value.RequestId }}</td></tr>
+            {{ if $value.LastResponse }}
+                <tr><td>Last response: </td></tr>
+                    <tr><td>Status: </td>
+                {{ if $value.LastResponse.Result }}
+                    {{ if $value.LastResponse.Result.Committed }}
+                        <td><span class="greenCol">Sent</span></td></tr>
+                    {{ else }}
+                        <tr><td>Last response: </td><td><span class="redCol">Pending</span></td></tr>
+                    {{ end }}
+                {{ else }}
+                    <td><span class="redCol">Pending</span></td></tr>
+                {{end}}
+                <tr><td>View: </td><td>{{ $value.LastResponse.View}}</td></tr>
+                <tr><td>RequestID: </td><td>{{$value.LastResponse.RequestId}}</td></tr>
+                <tr><td>Result: </td><td>{{$value.LastResponse.Result}}</td></tr>
+            {{ else }}
+                <tr><td>Last response: </td><td>-</td></tr>
+            {{ end }}
+        </table>
+    </div>
+    {{ end }}
+</div>
+</body>
+</html>

@@ -34,6 +34,7 @@ type ViewReplication interface {
 
 type ClientState struct {
 	Id string
+	RequestId int
 	LastResponse *OpResponse
 }
 
@@ -114,11 +115,6 @@ func (impl *Impl) Commit(req *CommitRequest, res *clientrpc.EmptyResponse) error
 	req.LogRequest(true)
 	impl.ActivityTimer.Reset(impl.ActivityTimeout)
 	isPrimaryReqRecvd = true
-	if req.CommitId == -1 {
-		// When running for the first time without any client requests, do nothing.
-
-		return nil
-	}
 	workReq := impl.BufferCommitRequest(req)
 	workReq.GetWG().Wait()
 	return nil
@@ -135,16 +131,16 @@ func (impl *Impl) BufferCommitRequest(req *CommitRequest) *clientrpc.WorkRequest
 func (impl *Impl) ProcessCommitRequests() {
 	for {
 		workReq := <-(impl.CommitQueue)
-		if impl.IsPrimary() {
-			continue
-		}
+
 		req := workReq.GetRequest().(*CommitRequest)
 		currOpId := impl.OpId
-		if req.CommitId == impl.CommitId {
-			continue
-		}
-		if req.CommitId > currOpId {
+		// If node is lagging behind, do state transfer.
+		if req.CommitId > currOpId || req.View > impl.View {
 			impl.WaitForStateTransfer(req.View)
+		}
+		if req.CommitId == impl.CommitId {
+			workReq.GetWG().Done()
+			continue
 		}
 		for i, _ := range impl.Ops {
 			if req.CommitId == impl.Ops[i].OpId {
@@ -162,6 +158,10 @@ func (impl *Impl) ProcessCommitRequests() {
 
 func (impl *Impl) GetState(req *GetStateRequest) *NewStateResponse {
 	req.LogRequest(true)
+
+	if req.View > impl.View {
+		return nil
+	}
 
 	ops := make([]log2.Operation, 0)
 	for _, op := range impl.Ops {
@@ -183,45 +183,48 @@ func (impl *Impl) GetState(req *GetStateRequest) *NewStateResponse {
 
 func (impl *Impl) WaitForStateTransfer(view int) {
 	if view >= impl.View {
+		// Set opID to last committed op and clear all ops after it.
 		impl.OpId = impl.CommitId
 		impl.ClearOpsAfterOpId()
 		replicas := impl.GetOtherReplicas()
 		for i, _ := range replicas {
-			var done chan bool
-			var res = &NewStateResponse{
-				View:      impl.View,
-				OpId:      -1,
-				CommitId:  -1,
+			var res = NewStateResponse{
+				View:      view,
+				OpId:      -2,
+				CommitId:  -2,
 				Ops:       nil,
+				Primary: -1,
 				ReplicaId: replicas[i].Id,
 				DestId: impl.Config.Id,
 			}
-			getStateReq := &GetStateRequest{
+			var opId int
+			if view == impl.View {
+				opId = impl.OpId
+			} else {
+				opId = impl.CommitId
+			}
+			getStateReq := GetStateRequest{
 				View:      view,
-				OpId:      impl.OpId,
+				OpId:      opId,
 				ReplicaId: impl.Config.Id,
 				DestId: replicas[i].Id,
 			}
 			getStateReq.LogRequest(false)
-			go func() {
-				replicas[i].Do("ViewManager.GetState", getStateReq, res, false)
+				replicas[i].Do("ViewManager.GetState", &getStateReq, &res, false)
 				res.LogResponse(true)
-				if res.View == -1 {
+				if res.View == -1 || res.OpId < opId {
 					// This means the replica hasn't processed the state transfer request and is ignoring it.
-					done <- false
+					continue
 				}
 				for _, op := range res.Ops {
 					impl.Ops = append(impl.Ops, op)
 				}
+				// Update latest primary node after state transfer.
+				impl.UpdatePrimaryNode(res.Primary)
 				impl.View = res.View
 				impl.OpId = res.OpId
 				impl.DoPendingCommits(res.CommitId)
-				done <- true
-			}()
-			fin := <- done
-			if fin {
 				break
-			}
 		}
 	}
 }
@@ -245,6 +248,7 @@ func (impl *Impl) ClearOpsAfterOpId() {
 			idx++
 		}
 	}
+	// If no logs are present, do nothing.
 	if idx == 0 {
 		return
 	}
@@ -269,18 +273,18 @@ func (impl *Impl) AppendOp(opId int, logMsg log2.LogMessage) log2.Operation {
 
 func (impl *Impl) GetBackups() []Replica {
 	backups := make([]Replica, 0)
-	for i, replica := range impl.Config.replicas {
+	for i, replica := range impl.Config.Replicas {
 		if !replica.IsPrimary() {
-			backups = append(backups, impl.Config.replicas[i])
+			backups = append(backups, impl.Config.Replicas[i])
 		}
 	}
 	return backups
 }
 
 func (impl *Impl) GetPrimary() Replica {
-	for i, replica := range impl.Config.replicas {
+	for i, replica := range impl.Config.Replicas {
 		if replica.IsPrimary() {
-			return impl.Config.replicas[i]
+			return impl.Config.Replicas[i]
 		}
 	}
 	return Replica{}
@@ -288,9 +292,9 @@ func (impl *Impl) GetPrimary() Replica {
 
 func (impl *Impl) GetOtherReplicas() []Replica {
 	replicas := make([]Replica, 0)
-	for i, _ := range impl.Config.replicas {
-		if impl.Config.Id != impl.Config.replicas[i].Id {
-			replicas = append(replicas, impl.Config.replicas[i])
+	for i, _ := range impl.Config.Replicas {
+		if impl.Config.Id != impl.Config.Replicas[i].Id {
+			replicas = append(replicas, impl.Config.Replicas[i])
 		}
 	}
 	var selfIdx = -1
@@ -322,11 +326,6 @@ func (impl *Impl) GetClientState(clientId string) *ClientState {
 func (impl *Impl) CreateClientState(clientId string) *ClientState {
 	impl.ClientStates[clientId] = &ClientState{
 		Id:         clientId,
-		LastResponse: &OpResponse{
-			View:      -1,
-			RequestId: -1,
-			Result:    nil,
-		},
 	}
 	return impl.ClientStates[clientId]
 }
@@ -337,10 +336,15 @@ func (impl *Impl) UpdateClientState(clientId string, requestId int, res *log2.Op
 		log.Printf("Failed to lookup clientId %s; Creating new client state", clientId)
 		cs = impl.CreateClientState(clientId)
 	}
-	cs.LastResponse = &OpResponse{
-		View:      impl.View,
-		RequestId: requestId,
-		Result:    res,
+	if requestId > cs.RequestId {
+		cs.RequestId = requestId
+	}
+	if res != nil {
+		cs.LastResponse = &OpResponse{
+			View:      impl.View,
+			RequestId: requestId,
+			Result:    res,
+		}
 	}
 	return cs.LastResponse
 }
@@ -503,17 +507,17 @@ func prepareConfig() Configuration {
 
 	var r = replicas[sConfig.Id]
 	c := Configuration{
-		Id:       sConfig.Id,
-		Self: &r,
+		Id:         sConfig.Id,
+		Self:       &r,
 		QuorumSize: sConfig.QuorumSize,
-		replicas: replicas,
-		clients: clients,
-		primary:  isPrimary,
+		Replicas:   replicas,
+		clients:    clients,
+		primary:    isPrimary,
 	}
 	log.Printf("Configuration: %+v", spew.NewFormatter(c))
 	return c
 }
-func Init() {
+func Init(rs *rpc.Server) {
 	config := prepareConfig()
 	log2.Init(strconv.Itoa(config.Id))
 	var timeout time.Duration
@@ -539,14 +543,13 @@ func Init() {
 		ActivityTimer:   time.NewTimer(timeout),
 		ActivityTimeout: timeout,
 	}
-	log.Printf("[INFO] ViewReplication Config: %+v", config)
 	if vrImpl.ClusterStatus == StatusRecover {
 		// Create unique nonce for the request.
 		nonce := make([]byte, 12)
 		if _, err := rand.Read(nonce); err != nil {
 			panic(err.Error())
 		}
-		// Send recovery request to all replicas.
+		// Send recovery request to all Replicas.
 		done := vrImpl.SendRecoveryRequests(nonce)
 		// Wait for quorum to be reached and for primary to respond.
 		res := vrImpl.WaitForRecoveryQuorum(nonce, done)
@@ -561,11 +564,11 @@ func Init() {
 		vrImpl.OpId = res.OpId
 		vrImpl.CommitId = res.CommitId
 		// Resume Normal operation of cluster.
-		vrImpl.ClusterStatus = StatusNormal
+		vrImpl.SetClusterStatusNormal()
 	}
 
 	// Only after recovery is done, will this node be available to receive requests.
-	rpc.RegisterName("ViewReplication", vrImpl)
+	rs.RegisterName("ViewReplication", vrImpl)
 	go vrImpl.ProcessPrepareRequests()
 	go vrImpl.ProcessCommitRequests()
 	log.Print("ViewReplication initialization successful")

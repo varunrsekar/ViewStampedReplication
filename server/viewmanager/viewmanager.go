@@ -1,7 +1,6 @@
 package viewmanager
 
 import (
-	"github.com/davecgh/go-spew/spew"
 	"log"
 	"net/rpc"
 	"time"
@@ -45,21 +44,18 @@ func newVmImpl() *Impl {
 func (impl *Impl) StartViewChange(req *StartViewChangeRequest, res *clientrpc.EmptyResponse) error {
 		req.LogRequest(true)
 
-		//impl.pendingViewChangeRequests.Lock()
-		var quorum int
-		quorum = len(impl.pendingViewChangeRequests.r)
-		log.Printf("Quorum: %d", quorum)
-
 		if req.View < impl.View {
-			log.Printf("Current view is greater than view in request; current: %d, req: %d", impl.View, req.View)
-			//impl.pendingViewChangeRequests.Unlock()
+			log.Printf("Current view is greater than view in request; currView: %d, reqView: %d", impl.View, req.View)
 			return nil
 		} else if req.View > impl.View {
 			log.Printf("Requested StartViewChange is for a greater view; Initiating a new view change request; reqView: %d, currView: %d", req.View, impl.View)
 			impl.pendingViewChangeRequests.r = make(map[int]clientrpc.Request)
 			impl.pendingViewChangeRequests.r[req.ReplicaId] = req
 			impl.RequestViewChange(req.View)
-			//impl.pendingViewChangeRequests.Unlock()
+			return nil
+		}
+		if impl.IsClusterStatusNormal() {
+			log.Printf("Requested StartViewChange is for current view. Ignoring request; currView: %d, reqView: %d", impl.View, req.View)
 			return nil
 		}
 
@@ -67,7 +63,6 @@ func (impl *Impl) StartViewChange(req *StartViewChangeRequest, res *clientrpc.Em
 			s := impl.pendingViewChangeRequests.r[req.ReplicaId].(*StartViewChangeRequest)
 			if req.View < s.View {
 				log.Printf("Current view change request is not greater than view in current request; pending: %d, req: %d", req.View, s.View)
-				//impl.pendingViewChangeRequests.Unlock()
 				return nil
 			}
 			log.Printf("New view is greater than pending view change; pending: %d, req: %d", s.View, req.View)
@@ -75,18 +70,19 @@ func (impl *Impl) StartViewChange(req *StartViewChangeRequest, res *clientrpc.Em
 
 		log.Printf("Adding StartViewChange request from replica %d to self; req: %+v", req.ReplicaId, req)
 		impl.pendingViewChangeRequests.r[req.ReplicaId] = req
-
+		var quorum int
+		quorum = len(impl.pendingViewChangeRequests.r)
+		log.Printf("StartViewChange Quorum: %d", quorum)
 		if quorum < impl.GetQuorumSize() {
 			log.Printf("Quorum not reached; reqCount: %d", quorum)
 			selfReq := impl.pendingViewChangeRequests.r[impl.Config.Id]
-			if  selfReq != nil {
+			if selfReq != nil {
 				// Send StartViewChange requests if I haven't already.
 				impl.RequestViewChange(req.View)
 			}
 			return nil
 		}
 		impl.SendDoViewChangeRequest()
-		//impl.pendingViewChangeRequests.Unlock()
 		return nil
 }
 
@@ -95,7 +91,7 @@ func (impl *Impl) SendDoViewChangeRequest() {
 		return
 	}
 	newPrimary := impl.findNewPrimary()
-	replicas := impl.GetOtherReplicas()
+	replicas := impl.Config.Replicas
 	for i, _:= range replicas {
 		if replicas[i].Id == newPrimary {
 			doViewChangeReq := &DoViewChangeRequest{
@@ -109,7 +105,8 @@ func (impl *Impl) SendDoViewChangeRequest() {
 			}
 			doViewChangeReq.LogRequest(false)
 			log.Printf("Sending DoViewChangeRequest to replica; replica: %d, req: %+v", replicas[i].Id, doViewChangeReq)
-			replicas[i].Do("ViewManager.DoViewChange", doViewChangeReq, &clientrpc.EmptyResponse{}, false)
+			r := replicas[i]
+			(&r).Do("ViewManager.DoViewChange", doViewChangeReq, &clientrpc.EmptyResponse{}, false)
 			break
 		}
 	}
@@ -128,36 +125,36 @@ func (impl *Impl) findNewPrimary() int {
 }
 
 func (impl *Impl) DoViewChange(req *DoViewChangeRequest, res *clientrpc.EmptyResponse) error {
-	req.LogRequest(true)
-
-	if req.View > impl.View {
-		log.Printf("Requested DoViewChange is for a greater view; Initiating a new view change request; reqView: %d, currView: %d", req.View, impl.View)
-		impl.RequestViewChange(req.View)
-	}
-	impl.SetClusterStatusViewChange()
 	impl.doViewChangeQueue <- req
 	return nil
 }
 
 func (impl *Impl) ProcessDoViewChangeRequests() {
-	var quorum int
+	var quorum = 0
 	var maxLatestNormalView = -1
 	var maxOpId = -1
 	var maxCommitId = -1
-	var currView = -1
 	var opsFromLatestNormalView = make([]log2.Operation, 0)
 	for {
 		req := <- impl.doViewChangeQueue
-		quorum += 1
-		if req.View > currView {
+		req.LogRequest(true)
+
+		if req.View > impl.View {
+			log.Printf("Requested DoViewChange is for a greater view; Initiating a new view change request; reqView: %d, currView: %d", req.View, impl.View)
+			impl.RequestViewChange(req.View)
 			quorum = 1
 			maxOpId = req.OpId
 			maxLatestNormalView = req.LatestNormalView
 			maxCommitId = req.CommitId
-			currView = req.View
 			opsFromLatestNormalView = req.Ops
 			continue
 		}
+		if impl.IsClusterStatusNormal() {
+			log.Printf("Requested DoViewChange is for current view. Ignoring request; currView: %d, reqView: %d", impl.View, req.View)
+			continue
+		}
+		quorum += 1
+		log.Printf("DoViewChange Quorum: %d", quorum)
 		if req.LatestNormalView > maxLatestNormalView {
 			maxLatestNormalView = req.LatestNormalView
 			opsFromLatestNormalView = req.Ops
@@ -202,6 +199,7 @@ func (impl *Impl) ProcessDoViewChangeRequests() {
 				startViewReq.LogRequest(false)
 				replicas[i].Do("ViewManager.StartView", startViewReq, &clientrpc.EmptyResponse{}, true)
 			}
+			log.Printf("ViewCHANGE END: %d", time.Now().UnixNano())
 			// Start sending commit requests after half the time.
 			impl.ActivityTimer.Reset(impl.ActivityTimeout/2)
 		}
@@ -214,13 +212,10 @@ func (impl *Impl) StartView(req *StartViewRequest, res *clientrpc.EmptyResponse)
 	impl.View = req.View
 	impl.Ops = req.Ops
 	impl.OpId = req.OpId
-	//impl.pendingViewChangeRequests.Lock()
-	//defer impl.pendingViewChangeRequests.Unlock()
 	impl.sentStartViewChange = make(map[int]bool)
 	impl.sentDoViewChange = make(map[int]bool)
 	impl.pendingViewChangeRequests.r = make(map[int]clientrpc.Request)
 	impl.UpdatePrimaryNode(req.ReplicaId)
-	impl.SetPrimaryReqRecvd(false)
 	impl.ActivityTimer.Reset(impl.ActivityTimeout)
 	impl.SetClusterStatusNormal()
 	if len(impl.Ops) == 0 {
@@ -253,6 +248,7 @@ func (impl *Impl) GetState(req *viewreplication.GetStateRequest, res *viewreplic
 			OpId:      -1,
 			CommitId:  -1,
 			Ops:       make([]log2.Operation, 0),
+			Primary: impl.GetPrimary().Id,
 			ReplicaId: impl.Config.Id,
 			DestId: req.ReplicaId,
 		}
@@ -266,6 +262,7 @@ func (impl *Impl) GetState(req *viewreplication.GetStateRequest, res *viewreplic
 			OpId:      vrRes.OpId,
 			CommitId:  vrRes.CommitId,
 			Ops:       vrRes.Ops,
+			Primary: impl.GetPrimary().Id,
 			ReplicaId: vrRes.ReplicaId,
 			DestId: req.ReplicaId,
 		}
@@ -277,7 +274,6 @@ func (impl *Impl) GetState(req *viewreplication.GetStateRequest, res *viewreplic
 func (impl *Impl) SendPrepareMessages(clientId string, requestId int, op log2.Operation) {
 	impl.ActivityTimer.Reset(impl.ActivityTimeout)
 	backups := impl.GetOtherReplicas()
-	log.Printf("backups: %+v", spew.NewFormatter(backups))
 	for i, _ := range backups {
 		req := &viewreplication.PrepareRequest{
 			ClientId: clientId,
@@ -302,10 +298,11 @@ func (impl *Impl) AdvanceView() {
 }
 
 func (impl *Impl) RequestViewChange(view int) {
+	log.Printf("ViewCHANGE INIT: %d", time.Now().UnixNano())
 	for impl.View < view {
 		impl.AdvanceView()
 	}
-	if impl.sentDoViewChange[impl.View] || impl.sentStartViewChange[impl.View] {
+	if impl.sentDoViewChange[view] || impl.sentStartViewChange[view] {
 		return
 	}
 	impl.SetClusterStatusViewChange()
@@ -327,8 +324,8 @@ func (impl *Impl) SendStartViewChangeRequests() {
 	impl.pendingViewChangeRequests.r[impl.Config.Id] = req
 	replicas := impl.GetOtherReplicas()
 	for i, _ := range replicas {
-		log.Printf("Sending StartViewChange request to replica; replica: %d, req: %v", replicas[i].Id, req)
 		req.DestId = replicas[i].Id
+		log.Printf("Sending StartViewChange request to replica; replica: %d, req: %v", replicas[i].Id, req)
 		req.LogRequest(false)
 		replicas[i].Do("ViewManager.StartViewChange", req, &clientrpc.EmptyResponse{}, true)
 	}
@@ -336,14 +333,16 @@ func (impl *Impl) SendStartViewChangeRequests() {
 }
 
 func (impl *Impl) MonitorActivity() {
+	// Wait for cluster formation on first-time startup.
 	if impl.IsPrimary() {
 		impl.WaitForCluster()
 	}
 	for {
-		t := <- impl.ActivityTimer.C
-		log.Printf("Hit Activity timer at %v", t.Format(time.RFC3339))
+		<- impl.ActivityTimer.C
 		impl.ActivityTimer.Reset(impl.ActivityTimeout)
 		if impl.IsPrimary() {
+			// Primary
+			// Ignore timeout in view-change/recovery mode.
 			if !impl.IsClusterStatusNormal() {
 				continue
 			}
@@ -360,10 +359,12 @@ func (impl *Impl) MonitorActivity() {
 				backups[i].Do("ViewReplication.Commit", commitReq, &clientrpc.EmptyResponse{}, true)
 			}
 		} else {
+			// Backups
+			// Ignore timeout in view-change/recovery mode.
 			if !impl.IsClusterStatusNormal() {
 				continue
 			}
-			// If never received first request from primary.
+			// Ignore timeout If never received first request from primary.
 			if !impl.IsPrimaryReqRecvd() {
 				continue
 			}
@@ -405,10 +406,11 @@ func GetImpl() *Impl {
 	return vmImpl
 }
 
-func Init() {
-	viewreplication.Init()
+func Init(rs *rpc.Server) {
+	viewreplication.Init(rs)
 	vmImpl = newVmImpl()
-	rpc.RegisterName("ViewManager", vmImpl)
+	//rpc.RegisterName("ViewManager", vmImpl)
+	rs.RegisterName("ViewManager", vmImpl)
 	go vmImpl.ProcessDoViewChangeRequests()
 	go vmImpl.MonitorActivity()
 	log.Print("ViewManager initialization successful")

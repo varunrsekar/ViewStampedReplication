@@ -3,6 +3,8 @@ package viewreplication
 import (
 	"fmt"
 	"log"
+	"net"
+	"time"
 	"viewStampedReplication/clientrpc"
 )
 
@@ -30,7 +32,6 @@ type Role int
 const (
 	RolePrimary Role = iota
 	RoleBackup
-	RoleUnknown
 )
 
 func (r Role) String() string {
@@ -38,18 +39,18 @@ func (r Role) String() string {
 	case RolePrimary:
 		return "Primary"
 	case RoleBackup:
-		return "Replica"
+		return "Backup"
 	}
 	return "Unknown"
 }
 
 type Configuration struct {
-	Id int
-	Self *Replica
-	replicas map[int]Replica
-	primary bool
+	Id         int
+	Self       *Replica
+	Replicas   map[int]Replica
+	primary    bool
 	QuorumSize int
-	clients map[string]Client
+	clients    map[string]Client
 }
 
 func (c *Configuration) IsPrimary() bool {
@@ -64,11 +65,11 @@ func (c *Configuration) SetPrimary(id int, self bool) {
 		c.primary = false
 		c.Self.SetBackup()
 	}
-	for i, _  := range c.replicas {
-		if c.replicas[i].Id == id {
-			c.replicas[i] = NewReplica(id, c.replicas[i].port, RolePrimary)
+	for i, _  := range c.Replicas {
+		if c.Replicas[i].Id == id {
+			c.Replicas[i] = NewReplica(id, c.Replicas[i].port, RolePrimary)
 		} else {
-			c.replicas[i] = NewReplica(c.replicas[i].Id, c.replicas[i].port, RoleBackup)
+			c.Replicas[i] = NewReplica(c.Replicas[i].Id, c.Replicas[i].port, RoleBackup)
 		}
 	}
 }
@@ -82,6 +83,16 @@ type Replica struct {
 	c    clientrpc.Client
 	Role Role
 	port int
+}
+
+func (r Replica) IsConnected() bool {
+	conn, err := net.DialTimeout("tcp", r.c.Hostname, time.Second)
+	log.Printf("Attempted to connect to :%v, err: %v", r.c.Hostname, err)
+	if conn != nil {
+		conn.Close()
+		return true
+	}
+	return false
 }
 
 func (r *Replica) IsPrimary() bool {

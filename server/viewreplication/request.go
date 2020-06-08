@@ -61,6 +61,7 @@ type NewStateResponse struct {
 	OpId int
 	CommitId int
 	Ops []log2.Operation
+	Primary int
 	ReplicaId int
 	DestId int
 }
@@ -73,6 +74,13 @@ type OpResponse struct {
 	View      int
 	RequestId int
 	Result    *log2.OpResult
+}
+
+func (or *OpResponse) String() string {
+	if or.Result == nil {
+		return fmt.Sprintf("View: %d\nRequest ID: %d", or.View, or.RequestId)
+	}
+	return fmt.Sprintf("View: %d\nRequest ID: %d\nResult: %s", or.View, or.RequestId, or.Result)
 }
 
 func (or *OpResponse) LogResponse(recv bool) {

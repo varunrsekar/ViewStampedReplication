@@ -15,6 +15,19 @@ var opLogger *logrus.Logger
 type OpResult struct {
 	Val *string
 	Err *string
+	Committed bool
+}
+
+func (or *OpResult) String() string {
+	var str string
+	if or.Val != nil {
+		str = fmt.Sprintf("Value(%s)", *or.Val)
+	} else if or.Err != nil {
+		str = fmt.Sprintf("Error(%s)", *or.Err)
+	} else {
+		str = "<nil>"
+	}
+	return str
 }
 
 type Message struct {
@@ -59,12 +72,17 @@ func (op *Operation) Commit() *OpResult {
 		err = store.Get().Create(msg.Key, *msg.Val)
 	case "DELETE":
 		err = store.Get().Delete(msg.Key)
-	case "GET":
+	case "READ":
 		val, err = store.Get().Read(msg.Key)
 	case "UPDATE":
 		err = store.Get().Update(msg.Key, *msg.Val)
 	}
-	if err == nil {
+	if val == "" && err == nil {
+		op.Result = &OpResult{
+			Val: msg.Val,
+			Err: nil,
+		}
+	} else if err == nil {
 		op.Result = &OpResult{
 			Val: &val,
 			Err: nil,
@@ -78,13 +96,15 @@ func (op *Operation) Commit() *OpResult {
 	}
 
 	op.Committed = true
+	op.Result.Committed = true
+	log.Printf("Got commit result; val: %v, err: %v, committed: %v", val, err, op.Result.Committed)
 	return op.Result
 }
 
 func (op *Operation) IsQuorumSatisfied() bool {
 	count := len(op.Quorum)
 	log.Printf("Operation quorum: %d; opId: %d", count, op.OpId)
-	if count == serviceconfig.GetConfig().QuorumSize {
+	if count == serviceconfig.GetConfig().QuorumSize - 1 {
 		log.Printf("Quorum satisfied; recvd: %d", count)
 		return true
 	}
